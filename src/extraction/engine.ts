@@ -1,5 +1,6 @@
 import { DirectApiClient } from '../network/direct-api';
 import { BrowserInterceptExtractor } from '../network/browser-intercept';
+import { TaobaoBrowserExtractor } from '../network/taobao-browser';
 import { TaobaoApiClient } from '../network/taobao-api';
 import { TaobaoReviewClient } from '../network/taobao-reviews';
 import { ResponseValidator } from '../validation/validator';
@@ -17,6 +18,7 @@ export class ExtractionEngine {
   private taobaoApi: TaobaoApiClient;
   private taobaoReviews: TaobaoReviewClient;
   private browserExtractor?: BrowserInterceptExtractor;
+  private taobaoBrowserExtractor?: TaobaoBrowserExtractor;
   private validator: ResponseValidator;
   private normalizer: ProductNormalizer;
   private taobaoNormalizer: TaobaoNormalizer;
@@ -108,7 +110,7 @@ export class ExtractionEngine {
     return null;
   }
 
-  private async extractTaobao(itemId: string, platform: Platform, attemptBrowser = false): Promise<ScrapedRecord | null> {
+  private async extractTaobao(itemId: string, platform: 'taobao' | 'tmall', attemptBrowser = false): Promise<ScrapedRecord | null> {
     const recordId = generateId();
     const startTime = Date.now();
 
@@ -117,12 +119,82 @@ export class ExtractionEngine {
 
     if (!detailResult.success || !detailResult.data) {
       logger.warn({ itemId, error: detailResult.error }, 'Taobao H5 API failed');
+      if (attemptBrowser || detailResult.requiresBrowser) {
+        return this.extractTaobaoFromBrowser(itemId, platform, recordId, startTime, detailResult.retries);
+      }
       return null;
     }
 
-    const detail = detailResult.data;
+    const validation = this.validator.validateTaobaoItemDetail(detailResult.data);
+    if (!validation.valid || !validation.data) {
+      logger.warn({ itemId, errors: validation.errors }, 'Taobao H5 response failed validation');
+      return null;
+    }
 
-    // Step 2: Fetch reviews
+    return this.buildTaobaoRecord(
+      itemId,
+      platform,
+      recordId,
+      startTime,
+      validation.data,
+      'direct-api',
+      detailResult.retries,
+      detailResult.statusCode || 200,
+      detailResult.bytesReceived
+    );
+  }
+
+  private async extractTaobaoFromBrowser(
+    itemId: string,
+    platform: 'taobao' | 'tmall',
+    recordId: string,
+    startTime: number,
+    retries: number
+  ): Promise<ScrapedRecord | null> {
+    try {
+      if (!this.taobaoBrowserExtractor) {
+        this.taobaoBrowserExtractor = new TaobaoBrowserExtractor();
+        await this.taobaoBrowserExtractor.initialize();
+      }
+
+      const browserResult = await this.taobaoBrowserExtractor.extract(itemId, platform);
+      if (!browserResult) return null;
+
+      const validation = this.validator.validateTaobaoItemDetail(browserResult.detail);
+      if (!validation.valid || !validation.data) {
+        logger.warn({ itemId, errors: validation.errors }, 'Taobao browser response failed validation');
+        return null;
+      }
+
+      return this.buildTaobaoRecord(
+        itemId,
+        platform,
+        recordId,
+        startTime,
+        validation.data,
+        'browser-intercept',
+        retries,
+        200,
+        browserResult.bytesReceived
+      );
+    } catch (err) {
+      logger.error({ itemId, err }, 'Taobao browser extraction failed');
+      return null;
+    }
+  }
+
+  private async buildTaobaoRecord(
+    itemId: string,
+    platform: 'taobao' | 'tmall',
+    recordId: string,
+    startTime: number,
+    detail: import('../types/taobao').TaobaoItemDetail,
+    extractionMethod: 'direct-api' | 'browser-intercept',
+    retries: number,
+    requestStatus: number,
+    bytesReceived?: number
+  ): Promise<ScrapedRecord> {
+    // Reviews remain best-effort; the product record never contains invented data.
     let reviews: any[] = [];
     let reviewCount: number | undefined;
     try {
@@ -138,7 +210,6 @@ export class ExtractionEngine {
     detail.reviews = reviews;
     detail.reviewCount = reviewCount;
 
-    // Step 3: Normalize
     const normalized = this.taobaoNormalizer.normalize(itemId, detail);
 
     return {
@@ -147,18 +218,19 @@ export class ExtractionEngine {
       sourceUrl: detail.itemUrl,
       timestamp: nowISO(),
       platform,
-      extractionMethod: 'direct-api',
-      requestStatus: detailResult.statusCode || 200,
-      latencyMs: detailResult.latencyMs,
+      extractionMethod,
+      requestStatus,
+      latencyMs: Date.now() - startTime,
       rawResponse: detail as any,
       normalized: normalized as any,
-      retryCount: detailResult.retries,
-      bytesReceived: detailResult.bytesReceived,
+      retryCount: retries,
+      bytesReceived,
     };
   }
 
   async shutdown(): Promise<void> {
     await this.browserExtractor?.close();
+    await this.taobaoBrowserExtractor?.close();
     this.taobaoApi.clearCache();
   }
 }

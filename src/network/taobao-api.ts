@@ -1,7 +1,7 @@
 import axios, { AxiosRequestConfig } from 'axios';
 import crypto from 'crypto';
 import { logger } from '../logging';
-import { withRetry, classifyError, ErrorCategory } from '../retry';
+import { withRetry } from '../retry';
 import { TaobaoItemDetail } from '../types/taobao';
 
 const APP_KEY = '12574478';
@@ -72,6 +72,7 @@ export class TaobaoApiClient {
     latencyMs: number;
     retries: number;
     error?: string;
+    requiresBrowser?: boolean;
     bytesReceived?: number;
   }> {
     const startTime = Date.now();
@@ -163,12 +164,13 @@ export class TaobaoApiClient {
     const latencyMs = Date.now() - startTime;
 
     if (!result.success) {
-      const category = classifyError(result.error);
+      const error = result.error?.message;
       return {
         success: false,
         latencyMs,
         retries: result.retries,
-        error: result.error?.message,
+        error,
+        requiresBrowser: this.isSecurityChallenge(error),
       };
     }
 
@@ -180,6 +182,29 @@ export class TaobaoApiClient {
       retries: result.retries,
       bytesReceived: result.result?.bytesReceived,
     };
+  }
+
+  /**
+   * Parse a detail response captured from a real Taobao/Tmall browser session.
+   * The browser may receive JSONP with a callback name different from the H5
+   * client's fixed callback, so accept either JSON or any JSONP wrapper.
+   */
+  parseBrowserDetailResponse(itemId: string, responseBody: string): TaobaoItemDetail | undefined {
+    const trimmed = responseBody.trim();
+    const jsonText = trimmed.startsWith('{') || trimmed.startsWith('[')
+      ? trimmed
+      : trimmed.replace(/^[^(]+\(/, '').replace(/\)\s*;?\s*$/, '');
+
+    try {
+      const parsed = JSON.parse(jsonText) as unknown;
+      if (!isRecord(parsed)) return undefined;
+      const ret = getArray(parsed, 'ret');
+      const retMsg = asString(ret[0]) || '';
+      if (retMsg && !retMsg.includes('SUCCESS')) return undefined;
+      return this.parseDetailData(itemId, parsed.data);
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -402,5 +427,10 @@ export class TaobaoApiClient {
 
   clearCache(): void {
     this.tokenCache.clear();
+  }
+
+  private isSecurityChallenge(error?: string): boolean {
+    if (!error) return false;
+    return /BLOCKED|USER_VALIDATE|X5|验证码|安全验证|访问被拒绝|anti-bot|challenge|captcha/i.test(error);
   }
 }
