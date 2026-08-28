@@ -1,0 +1,8 @@
+Variable	Default	Description	
+CONCURRENCY	16	Worker concurrency	
+REQUEST_RATE	50	Max requests per second	
+MAX_RETRIES	3	Max retry attempts per SKU	
+REQUEST_TIMEOUT	15000	HTTP request timeout (ms)	
+PROXY_POOL	-	Comma-separated proxy URLs	
+OUTPUT_FORMAT	jsonl	Output format (jsonl/json/csv)	
+JD_AREA_ID	1_2901_55554_0	Default geographic area code	

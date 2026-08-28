@@ -1,0 +1,164 @@
+import { DirectApiClient } from '../network/direct-api';
+import { BrowserInterceptExtractor } from '../network/browser-intercept';
+import { TaobaoApiClient } from '../network/taobao-api';
+import { TaobaoReviewClient } from '../network/taobao-reviews';
+import { ResponseValidator } from '../validation/validator';
+import { ProductNormalizer } from '../normalization/normalizer';
+import { TaobaoNormalizer } from '../normalization/taobao-normalizer';
+import { ScrapedRecord, WareBusinessResponse, NormalizedProduct } from '../types';
+import { logger } from '../logging';
+import { generateId, nowISO } from '../utils/helpers';
+import { config } from '../config';
+
+import { Platform } from '../types';
+
+export class ExtractionEngine {
+  private directApi: DirectApiClient;
+  private taobaoApi: TaobaoApiClient;
+  private taobaoReviews: TaobaoReviewClient;
+  private browserExtractor?: BrowserInterceptExtractor;
+  private validator: ResponseValidator;
+  private normalizer: ProductNormalizer;
+  private taobaoNormalizer: TaobaoNormalizer;
+
+  constructor() {
+    this.directApi = new DirectApiClient();
+    this.taobaoApi = new TaobaoApiClient();
+    this.taobaoReviews = new TaobaoReviewClient();
+    this.validator = new ResponseValidator();
+    this.normalizer = new ProductNormalizer();
+    this.taobaoNormalizer = new TaobaoNormalizer();
+  }
+
+  async extract(skuId: string, platform: Platform = 'jd', attemptBrowser = false): Promise<ScrapedRecord | null> {
+    // Deterministic platform routing
+    if (platform !== 'jd' && platform !== 'taobao' && platform !== 'tmall') {
+      logger.warn({ platform }, 'Invalid platform, defaulting to jd');
+      platform = 'jd';
+    }
+    if (platform === 'taobao' || platform === 'tmall') {
+      return this.extractTaobao(skuId, platform, attemptBrowser);
+    }
+    return this.extractJd(skuId, attemptBrowser);
+  }
+
+  private async extractJd(skuId: string, attemptBrowser = false): Promise<ScrapedRecord | null> {
+    const recordId = generateId();
+    const startTime = Date.now();
+
+    const directResult = await this.directApi.fetchWareBusiness(skuId);
+
+    if (directResult.success && directResult.data) {
+      const validation = this.validator.validateWareBusiness(directResult.data);
+      if (validation.valid && validation.data) {
+        const normalized = this.normalizer.normalize(skuId, validation.data);
+        return {
+          id: recordId,
+          skuId,
+          sourceUrl: `https://item.jd.com/${skuId}.html`,
+          timestamp: nowISO(),
+          platform: 'jd',
+          extractionMethod: 'direct-api',
+          requestStatus: directResult.statusCode || 200,
+          latencyMs: directResult.latencyMs,
+          rawResponse: validation.data,
+          normalized,
+          proxyUsed: directResult.proxyUsed,
+          retryCount: directResult.retries,
+          bytesReceived: directResult.bytesReceived,
+        };
+      }
+    }
+
+    if (attemptBrowser) {
+      logger.info({ skuId }, 'Falling back to browser interception');
+      try {
+        if (!this.browserExtractor) {
+          this.browserExtractor = new BrowserInterceptExtractor();
+          await this.browserExtractor.initialize();
+        }
+
+        const browserData = await this.browserExtractor.extract(skuId);
+        if (browserData) {
+          const validation = this.validator.validateWareBusiness(browserData);
+          if (validation.valid && validation.data) {
+            const normalized = this.normalizer.normalize(skuId, validation.data);
+            return {
+              id: recordId,
+              skuId,
+              sourceUrl: `https://item.jd.com/${skuId}.html`,
+              timestamp: nowISO(),
+              platform: 'jd',
+              extractionMethod: 'browser-intercept',
+              requestStatus: 200,
+              latencyMs: Date.now() - startTime,
+              rawResponse: validation.data,
+              normalized,
+              retryCount: directResult.retries,
+              bytesReceived: undefined,
+            };
+          }
+        }
+      } catch (err) {
+        logger.error({ skuId, err }, 'Browser extraction failed');
+      }
+    }
+
+    logger.warn({ skuId, directError: directResult.error }, 'All extraction levels failed');
+    return null;
+  }
+
+  private async extractTaobao(itemId: string, platform: Platform, attemptBrowser = false): Promise<ScrapedRecord | null> {
+    const recordId = generateId();
+    const startTime = Date.now();
+
+    // Step 1: Fetch item detail from H5 API
+    const detailResult = await this.taobaoApi.fetchItemDetail(itemId);
+
+    if (!detailResult.success || !detailResult.data) {
+      logger.warn({ itemId, error: detailResult.error }, 'Taobao H5 API failed');
+      return null;
+    }
+
+    const detail = detailResult.data;
+
+    // Step 2: Fetch reviews
+    let reviews: any[] = [];
+    let reviewCount: number | undefined;
+    try {
+      const reviewResult = await this.taobaoReviews.fetchReviews(itemId, platform === 'tmall');
+      if (reviewResult.success && reviewResult.reviews) {
+        reviews = reviewResult.reviews;
+        reviewCount = reviewResult.reviewCount;
+      }
+    } catch (err) {
+      logger.warn({ itemId, err }, 'Review fetch failed');
+    }
+
+    detail.reviews = reviews;
+    detail.reviewCount = reviewCount;
+
+    // Step 3: Normalize
+    const normalized = this.taobaoNormalizer.normalize(itemId, detail);
+
+    return {
+      id: recordId,
+      skuId: itemId,
+      sourceUrl: detail.itemUrl,
+      timestamp: nowISO(),
+      platform,
+      extractionMethod: 'direct-api',
+      requestStatus: detailResult.statusCode || 200,
+      latencyMs: detailResult.latencyMs,
+      rawResponse: detail as any,
+      normalized: normalized as any,
+      retryCount: detailResult.retries,
+      bytesReceived: detailResult.bytesReceived,
+    };
+  }
+
+  async shutdown(): Promise<void> {
+    await this.browserExtractor?.close();
+    this.taobaoApi.clearCache();
+  }
+}

@@ -1,0 +1,5 @@
+# Start with seed SKUs
+npm start -- scrape --skus 100012043978 100065474274 --concurrency 32
+
+# Resume from checkpoint
+npm start -- resume
