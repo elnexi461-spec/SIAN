@@ -46,6 +46,7 @@ Thumbs.db
 # Playwright
 playwright-report/
 test-results/
+.taobao-browser-profile/
 
 # Temporary files
 tmp/

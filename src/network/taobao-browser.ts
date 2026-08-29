@@ -1,5 +1,5 @@
-import { chromium, BrowserContext, Page, Response } from 'playwright';
-import { mkdirSync } from 'fs';
+import { chromium, Browser, BrowserContext, Page, Response } from 'playwright';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import path from 'path';
 import { logger } from '../logging';
 import { TaobaoApiClient } from './taobao-api';
@@ -18,30 +18,74 @@ export interface TaobaoBrowserExtraction {
  * persistent browser session to complete it.
  */
 export class TaobaoBrowserExtractor {
+  private browser?: Browser;
   private context?: BrowserContext;
   private page?: Page;
   private currentItemId?: string;
   private capturedResponses = new Map<string, string[]>();
   private readonly apiParser = new TaobaoApiClient();
+  private browserbaseSessionId?: string;
+  private browserbaseApiKey?: string;
+  private liveViewUrl?: string;
 
   async initialize(): Promise<void> {
+    const apiKey = process.env.BROWSERBASE_API_KEY;
+    if (!apiKey) {
+      throw new Error('BROWSERBASE_API_KEY is not configured');
+    }
+
     const profileDir = path.resolve(process.env.TAOBAO_PROFILE_DIR || '.taobao-browser-profile');
     mkdirSync(profileDir, { recursive: true });
+    this.browserbaseApiKey = apiKey;
 
-    const headless = process.env.TAOBAO_BROWSER_HEADLESS === 'true';
-    this.context = await chromium.launchPersistentContext(profileDir, {
-      headless,
-      locale: 'zh-CN',
-      viewport: { width: 1440, height: 1000 },
-      userAgent: process.env.TAOBAO_BROWSER_USER_AGENT ||
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    const contextId = await this.getOrCreateBrowserbaseContext(profileDir);
+    const session = await this.browserbaseRequest<{
+      id: string;
+      connectUrl: string;
+    }>('/v1/sessions', 'POST', {
+      browserSettings: {
+        context: {
+          id: contextId,
+          persist: true,
+        },
+        viewport: { width: 1440, height: 1000 },
+      },
+      keepAlive: true,
     });
+
+    if (!session.id || !session.connectUrl) {
+      throw new Error('Browserbase did not return a usable browser session');
+    }
+
+    this.browserbaseSessionId = session.id;
+
+    const liveView = await this.browserbaseRequest<{
+      debuggerFullscreenUrl: string;
+    }>(`/v1/sessions/${session.id}/debug`, 'GET');
+    if (!liveView.debuggerFullscreenUrl) {
+      throw new Error('Browserbase did not return a debuggerFullscreenUrl');
+    }
+    this.liveViewUrl = liveView.debuggerFullscreenUrl;
+
+    this.browser = await chromium.connectOverCDP(session.connectUrl);
+    this.context = this.browser.contexts()[0];
+    if (!this.context) {
+      throw new Error('Browserbase session has no default context');
+    }
 
     this.page = this.context.pages()[0] || await this.context.newPage();
     this.page.on('response', (response) => {
       void this.captureDetailResponse(response);
     });
-    logger.info({ profileDir, headless }, 'Taobao persistent browser session opened');
+
+    logger.info(
+      {
+        sessionId: session.id,
+        sessionUrl: `https://browserbase.com/sessions/${session.id}`,
+        liveViewUrl: this.liveViewUrl,
+      },
+      'Taobao Browserbase session opened; use the live view for manual verification'
+    );
   }
 
   async extract(itemId: string, platform: 'taobao' | 'tmall'): Promise<TaobaoBrowserExtraction | undefined> {
@@ -80,9 +124,61 @@ export class TaobaoBrowserExtractor {
   }
 
   async close(): Promise<void> {
-    await this.context?.close();
+    await this.browser?.close();
+    if (this.browserbaseSessionId && this.browserbaseApiKey) {
+      try {
+        await this.browserbaseRequest(`/v1/sessions/${this.browserbaseSessionId}`, 'POST', {});
+      } catch (err) {
+        logger.warn({ sessionId: this.browserbaseSessionId, err }, 'Browserbase session release failed');
+      }
+    }
+    this.browser = undefined;
     this.context = undefined;
     this.page = undefined;
+    this.browserbaseSessionId = undefined;
+    this.browserbaseApiKey = undefined;
+  }
+
+  private async getOrCreateBrowserbaseContext(profileDir: string): Promise<string> {
+    const configuredContextId = process.env.BROWSERBASE_CONTEXT_ID;
+    if (configuredContextId) return configuredContextId;
+
+    const contextFile = path.join(profileDir, 'browserbase-context-id');
+    if (existsSync(contextFile)) {
+      const savedContextId = readFileSync(contextFile, 'utf8').trim();
+      if (savedContextId) return savedContextId;
+    }
+
+    const context = await this.browserbaseRequest<{ id: string }>('/v1/contexts', 'POST', {
+      name: 'sian-taobao',
+    });
+    if (!context.id) throw new Error('Browserbase did not return a persistent context ID');
+
+    writeFileSync(contextFile, `${context.id}\n`, { mode: 0o600 });
+    return context.id;
+  }
+
+  private async browserbaseRequest<T = unknown>(
+    requestPath: string,
+    method: 'GET' | 'POST',
+    body?: Record<string, unknown>
+  ): Promise<T> {
+    if (!this.browserbaseApiKey) throw new Error('Browserbase API key is not configured');
+
+    const response = await fetch(`https://api.browserbase.com${requestPath}`, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        'x-bb-api-key': this.browserbaseApiKey,
+      },
+      body: method === 'POST' ? JSON.stringify(body || {}) : undefined,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Browserbase ${method} ${requestPath} failed with HTTP ${response.status}`);
+    }
+
+    return response.json() as Promise<T>;
   }
 
   private async captureDetailResponse(response: Response): Promise<void> {
@@ -104,7 +200,10 @@ export class TaobaoBrowserExtractor {
   private async waitForVerificationAndProduct(itemId: string): Promise<void> {
     if (!this.page) return;
 
-    const timeoutMs = parseInt(process.env.TAOBAO_HUMAN_TIMEOUT_MS || '600000', 10);
+    const configuredTimeoutMs = parseInt(process.env.TAOBAO_HUMAN_TIMEOUT_MS || '600000', 10);
+    const timeoutMs = Number.isFinite(configuredTimeoutMs)
+      ? Math.max(600000, configuredTimeoutMs)
+      : 600000;
     const deadline = Date.now() + timeoutMs;
     let verificationReported = false;
     let verificationWasSeen = false;
@@ -116,7 +215,7 @@ export class TaobaoBrowserExtractor {
         if (!verificationReported) {
           verificationReported = true;
           logger.warn(
-            { itemId },
+            { itemId, sessionId: this.browserbaseSessionId, liveViewUrl: this.liveViewUrl },
             'Human verification required in the open Taobao browser; complete it manually to resume extraction'
           );
         }
