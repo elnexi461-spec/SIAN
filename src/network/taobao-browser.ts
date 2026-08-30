@@ -1,5 +1,6 @@
 import { chromium, Browser, BrowserContext, Page, Response } from 'playwright';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { randomUUID } from 'crypto';
 import path from 'path';
 import { logger } from '../logging';
 import { TaobaoApiClient } from './taobao-api';
@@ -172,7 +173,7 @@ export class TaobaoBrowserExtractor {
     }
 
     const context = await this.browserbaseRequest<{ id: string }>('/v1/contexts', 'POST', {
-      name: 'sian-taobao',
+      name: `sian-taobao-${randomUUID()}`,
     });
     if (!context.id) throw new Error('Browserbase did not return a persistent context ID');
 
