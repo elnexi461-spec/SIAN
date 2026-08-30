@@ -128,20 +128,31 @@ export class ExtractionEngine {
     const validation = this.validator.validateTaobaoItemDetail(detailResult.data);
     if (!validation.valid || !validation.data) {
       logger.warn({ itemId, errors: validation.errors }, 'Taobao H5 response failed validation');
+      if (attemptBrowser) {
+        return this.extractTaobaoFromBrowser(itemId, platform, recordId, startTime, detailResult.retries);
+      }
       return null;
     }
 
-    return this.buildTaobaoRecord(
-      itemId,
-      platform,
-      recordId,
-      startTime,
-      validation.data,
-      'direct-api',
-      detailResult.retries,
-      detailResult.statusCode || 200,
-      detailResult.bytesReceived
-    );
+    try {
+      return await this.buildTaobaoRecord(
+        itemId,
+        platform,
+        recordId,
+        startTime,
+        validation.data,
+        'direct-api',
+        detailResult.retries,
+        detailResult.statusCode || 200,
+        detailResult.bytesReceived
+      );
+    } catch (err) {
+      logger.warn({ itemId, err }, 'Taobao H5 normalization failed');
+      if (attemptBrowser) {
+        return this.extractTaobaoFromBrowser(itemId, platform, recordId, startTime, detailResult.retries);
+      }
+      return null;
+    }
   }
 
   private async extractTaobaoFromBrowser(

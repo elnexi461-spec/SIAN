@@ -5,6 +5,22 @@ import { logger } from '../logging';
 import { TaobaoApiClient } from './taobao-api';
 import { TaobaoItemDetail } from '../types/taobao';
 
+type UnknownRecord = Record<string, unknown>;
+
+function isRecord(value: unknown): value is UnknownRecord {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function asString(value: unknown): string | undefined {
+  if (typeof value === 'string') return value.trim() || undefined;
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  return undefined;
+}
+
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
 export interface TaobaoBrowserExtraction {
   detail: TaobaoItemDetail;
   bytesReceived?: number;
@@ -113,6 +129,12 @@ export class TaobaoBrowserExtractor {
       }
     }
 
+    const embeddedDetail = await this.extractEmbeddedProductData(itemId, platform);
+    if (embeddedDetail) {
+      logger.info({ itemId }, 'Extracted Taobao product data from embedded page JSON');
+      return { detail: embeddedDetail };
+    }
+
     const domDetail = await this.extractVisibleProductData(itemId, platform);
     if (domDetail) {
       logger.info({ itemId }, 'Extracted Taobao product data from browser page');
@@ -209,6 +231,11 @@ export class TaobaoBrowserExtractor {
     let verificationWasSeen = false;
 
     while (Date.now() < deadline) {
+      if (this.isLoginUrl()) {
+        logger.warn({ itemId }, 'Taobao login required; stopping browser extraction');
+        throw new Error('LOGIN_REQUIRED');
+      }
+
       const verificationRequired = await this.isVerificationRequired();
       if (verificationRequired) {
         verificationWasSeen = true;
@@ -229,8 +256,9 @@ export class TaobaoBrowserExtractor {
       }
 
       const hasCapturedResponse = (this.capturedResponses.get(itemId) || []).length > 0;
+      const hasEmbeddedProductData = await this.hasEmbeddedProductData();
       const hasProductContent = await this.hasProductContent();
-      if (hasCapturedResponse || hasProductContent) return;
+      if (hasCapturedResponse || hasEmbeddedProductData || hasProductContent) return;
 
       await this.page.waitForTimeout(1000);
     }
@@ -241,15 +269,429 @@ export class TaobaoBrowserExtractor {
     throw new Error(`Taobao product page did not load within ${timeoutMs}ms`);
   }
 
+  private isLoginUrl(): boolean {
+    if (!this.page) return false;
+    const currentUrl = this.page.url().toLowerCase();
+    return currentUrl.includes('login.taobao.com') || currentUrl.includes('login.tmall.com');
+  }
+
+  private async hasEmbeddedProductData(): Promise<boolean> {
+    if (!this.page) return false;
+    return this.page.evaluate(() => {
+      const doc = (globalThis as any).document;
+      return Boolean(doc.querySelector(
+        'script[type="application/json"], script[type="application/ld+json"], ' +
+        'script[id*="initial" i], script[id*="state" i], script[id*="product" i], script[id*="item" i]'
+      ));
+    }).catch(() => false);
+  }
+
+  private async extractEmbeddedProductData(
+    itemId: string,
+    platform: 'taobao' | 'tmall'
+  ): Promise<TaobaoItemDetail | undefined> {
+    if (!this.page) return undefined;
+
+    const payloads = await this.page.evaluate(() => {
+      const doc = (globalThis as any).document;
+      const scripts = Array.from(doc.scripts) as any[];
+      return scripts
+        .map(script => {
+          const type = (script.getAttribute('type') || '').toLowerCase();
+          const id = `${script.id} ${script.getAttribute('name') || ''} ${script.getAttribute('data-state') || ''}`;
+          const text = script.textContent || '';
+          const isJsonScript = type === 'application/json' || type === 'application/ld+json' || type.endsWith('+json');
+          const isStateScript = /initial|state|product|item|detail|preload/i.test(id) ||
+            /(?:__INITIAL_STATE__|__INITIAL_DATA__|INITIAL_STATE|initialState|itemData|productData|detailData)/.test(text);
+          return isJsonScript || isStateScript ? text : '';
+        })
+        .filter(Boolean);
+    }).catch(() => [] as string[]);
+
+    for (const payload of payloads) {
+      for (const candidate of this.parseEmbeddedPayloads(payload)) {
+        const browserDetail = this.apiParser.parseBrowserDetailResponse(itemId, JSON.stringify(candidate));
+        if (browserDetail) return browserDetail;
+
+        const product = this.findEmbeddedProduct(candidate);
+        if (!product) continue;
+
+        const detail = this.mapEmbeddedProduct(itemId, platform, product);
+        if (detail) return detail;
+      }
+    }
+
+    return undefined;
+  }
+
+  private parseEmbeddedPayloads(payload: string): unknown[] {
+    const trimmed = payload.trim();
+    if (!trimmed) return [];
+
+    const candidates: unknown[] = [];
+    const addJson = (text: string) => {
+      try {
+        candidates.push(JSON.parse(text));
+      } catch {
+        // The script may be an assignment or a serialized JSON.parse call.
+      }
+    };
+
+    addJson(trimmed);
+
+    for (const encoded of this.extractJsonParseArguments(trimmed)) {
+      try {
+        addJson(encoded);
+      } catch {
+        // Continue looking for another serialized state value.
+      }
+    }
+
+    let start = 0;
+    while (start < trimmed.length) {
+      const nextObject = trimmed.indexOf('{', start);
+      const nextArray = trimmed.indexOf('[', start);
+      const starts = [nextObject, nextArray].filter(index => index >= 0);
+      if (starts.length === 0) break;
+
+      const jsonStart = Math.min(...starts);
+      const jsonText = this.extractBalancedJson(trimmed, jsonStart);
+      if (!jsonText) break;
+      addJson(jsonText);
+      start = jsonStart + jsonText.length;
+    }
+
+    return candidates;
+  }
+
+  private extractJsonParseArguments(text: string): string[] {
+    const values: string[] = [];
+    let searchStart = 0;
+
+    while (searchStart < text.length) {
+      const callStart = text.indexOf('JSON.parse', searchStart);
+      if (callStart < 0) break;
+
+      const openParen = text.indexOf('(', callStart + 'JSON.parse'.length);
+      if (openParen < 0) break;
+
+      let index = openParen + 1;
+      while (/\s/.test(text[index] || '')) index++;
+      const quote = text[index];
+      if (quote !== '"' && quote !== "'" && quote !== '`') {
+        searchStart = openParen + 1;
+        continue;
+      }
+
+      index++;
+      let encoded = '';
+      let closed = false;
+      while (index < text.length) {
+        const char = text[index];
+        if (char === '\\' && index + 1 < text.length) {
+          encoded += char + text[index + 1];
+          index += 2;
+          continue;
+        }
+        if (char === quote) {
+          closed = true;
+          break;
+        }
+        encoded += char;
+        index++;
+      }
+
+      if (closed) {
+        try {
+          values.push(quote === '"'
+            ? JSON.parse(`"${encoded}"`)
+            : encoded.replace(/\\(['"`\\])/g, '$1').replace(/\\n/g, '\n').replace(/\\r/g, '\r'));
+        } catch {
+          // Ignore malformed serialized values.
+        }
+      }
+      searchStart = index + 1;
+    }
+
+    return values;
+  }
+
+  private extractBalancedJson(text: string, start: number): string | undefined {
+    const opening = text[start];
+    if (opening !== '{' && opening !== '[') return undefined;
+
+    const closing = opening === '{' ? '}' : ']';
+    let depth = 0;
+    let quote: '"' | "'" | undefined;
+    let escaped = false;
+
+    for (let index = start; index < text.length; index++) {
+      const char = text[index];
+      if (quote) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === '\\') {
+          escaped = true;
+        } else if (char === quote) {
+          quote = undefined;
+        }
+        continue;
+      }
+
+      if (char === '"' || char === "'") {
+        quote = char;
+      } else if (char === opening) {
+        depth++;
+      } else if (char === closing) {
+        depth--;
+        if (depth === 0) return text.slice(start, index + 1);
+      }
+    }
+
+    return undefined;
+  }
+
+  private findEmbeddedProduct(value: unknown, depth = 0): UnknownRecord | undefined {
+    if (depth > 8) return undefined;
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        const found = this.findEmbeddedProduct(entry, depth + 1);
+        if (found) return found;
+      }
+      return undefined;
+    }
+    if (!isRecord(value)) return undefined;
+
+    const type = asString(value['@type']);
+    const hasProductShape = type?.toLowerCase() === 'product' ||
+      Boolean(
+        (isRecord(value.item) && (value.seller || value.shopInfo || value.skuBase)) ||
+        value.title || value.name || value.itemTitle || value.itemName ||
+        value.price || value.offers || value.images || value.image
+      );
+    if (hasProductShape) return value;
+
+    for (const child of Object.values(value)) {
+      if (isRecord(child)) {
+        const found = this.findEmbeddedProduct(child, depth + 1);
+        if (found) return found;
+      } else if (Array.isArray(child)) {
+        for (const entry of child) {
+          const found = this.findEmbeddedProduct(entry, depth + 1);
+          if (found) return found;
+        }
+      }
+    }
+
+    return undefined;
+  }
+
+  private mapEmbeddedProduct(
+    itemId: string,
+    platform: 'taobao' | 'tmall',
+    product: UnknownRecord
+  ): TaobaoItemDetail | undefined {
+    const item = this.firstRecord(product, ['item', 'product', 'goods']) || product;
+    const seller = this.firstRecord(product, ['shopInfo', 'seller', 'shop', 'store']) || {};
+    const offers = this.firstRecord(product, ['offers', 'offer', 'priceInfo']) || {};
+    const title = this.firstString(item, ['title', 'name', 'itemTitle', 'itemName', 'subject']) ||
+      this.firstString(product, ['title', 'name', 'itemTitle', 'itemName', 'subject']) || '';
+    const images = this.extractImages(item, product);
+    const price = this.extractPrice(item, product, offers);
+
+    if (!title && images.length === 0 && !price) return undefined;
+
+    const skuBase = this.firstRecord(item, ['skuBase']) || {};
+    const rawProps = asArray(skuBase.props).length > 0 ? asArray(skuBase.props) : asArray(item.props);
+    const props = rawProps.filter(isRecord).map(prop => ({
+      pid: this.firstString(prop, ['pid', 'id']) || '',
+      name: this.firstString(prop, ['name', 'key', 'label']) || '',
+      values: asArray(prop.values).filter(isRecord).map(value => ({
+        vid: this.firstString(value, ['vid', 'id', 'valueId']) || '',
+        name: this.firstString(value, ['name', 'value', 'label']) || '',
+        image: this.normalizeEmbeddedUrl(this.firstString(value, ['image', 'img', 'imageUrl'])),
+      })),
+    })).filter(prop => prop.name || prop.values.length > 0);
+
+    const rawSkus = asArray(skuBase.skus).length > 0 ? asArray(skuBase.skus) : asArray(item.skus);
+    const skuCore = this.firstRecord(item, ['skuCore']) || {};
+    const skus = rawSkus.filter(isRecord).map(sku => {
+      const skuId = this.firstString(sku, ['skuId', 'id', 'sku']) || '';
+      const core = isRecord(skuCore[skuId]) ? skuCore[skuId] : {};
+      return {
+        skuId,
+        propPath: this.firstString(sku, ['propPath', 'properties', 'propertiesPath']) || '',
+        core,
+      };
+    }).filter(sku => sku.skuId).map(sku => sku);
+
+    const normalizedSkus = skus.map(sku => {
+      const skuPrice = this.extractPrice(sku.core, sku.core, this.firstRecord(sku.core, ['price']) || {});
+      const quantity = this.firstNumber(sku.core, ['quantity', 'stock', 'inventory']);
+      return {
+        skuId: sku.skuId,
+        propPath: sku.propPath,
+        ...(skuPrice ? { price: skuPrice } : {}),
+        ...(quantity !== undefined ? { quantity } : {}),
+        quantityText: this.firstString(sku.core, ['quantityText', 'stockText', 'inventoryText']),
+        logisticsTime: this.firstString(sku.core, ['logisticsTime', 'deliveryTime']),
+      };
+    });
+
+    const sellerType = this.firstString(seller, ['sellerType', 'shopType']) === 'B' || platform === 'tmall' ? 'B' : 'C';
+    const itemUrl = this.normalizeEmbeddedUrl(
+      this.firstString(item, ['itemUrl', 'url', 'link']) ||
+      this.firstString(product, ['itemUrl', 'url', 'link'])
+    ) || (platform === 'tmall'
+      ? `https://detail.tmall.com/item.htm?id=${itemId}`
+      : `https://item.taobao.com/item.htm?id=${itemId}`);
+
+    return {
+      itemId,
+      title,
+      images,
+      price: price || { priceMoney: '', priceText: '' },
+      originalPrice: this.extractOriginalPrice(item, product, offers),
+      vagueSellCount: this.firstString(item, ['vagueSellCount', 'sales', 'sellCount', 'soldCount']),
+      category: this.firstString(item, ['category', 'categoryName']),
+      shopInfo: {
+        shopId: this.firstString(seller, ['shopId', 'id', 'shop_id']) || '',
+        shopName: this.firstString(seller, ['shopName', 'name', 'title']) || '',
+        sellerId: this.firstString(seller, ['sellerId', 'userId', 'seller_id']) || '',
+        sellerNick: this.firstString(seller, ['sellerNick', 'nick', 'nickname']) || '',
+        sellerType,
+        pcShopUrl: this.normalizeEmbeddedUrl(this.firstString(seller, ['pcShopUrl', 'url', 'shopUrl'])),
+        shopIcon: this.normalizeEmbeddedUrl(this.firstString(seller, ['shopIcon', 'logo', 'icon'])),
+      },
+      skuBase: {
+        props,
+        skus: normalizedSkus.map(sku => ({ skuId: sku.skuId, propPath: sku.propPath })),
+      },
+      skuCore: normalizedSkus.length > 0
+        ? Object.fromEntries(normalizedSkus.map(sku => [sku.skuId, {
+          price: sku.price,
+          quantity: sku.quantity,
+          quantityText: sku.quantityText,
+          logisticsTime: sku.logisticsTime,
+        }]))
+        : undefined,
+      props: this.extractSimpleProps(item),
+      platform,
+      itemUrl,
+    };
+  }
+
+  private extractImages(item: UnknownRecord, product: UnknownRecord): string[] {
+    const rawImages = [
+      ...asArray(item.images),
+      ...asArray(product.images),
+      item.image,
+      item.mainImage,
+      item.picUrl,
+      item.pic_url,
+      product.image,
+      product.mainImage,
+    ];
+
+    return rawImages
+      .flatMap(value => isRecord(value) ? [value.url, value.src, value.image] : [value])
+      .map(asString)
+      .filter((value): value is string => Boolean(value))
+      .map(value => this.normalizeEmbeddedUrl(value) || value)
+      .filter((value, index, values) => values.indexOf(value) === index);
+  }
+
+  private extractPrice(
+    item: UnknownRecord,
+    product: UnknownRecord,
+    offers: UnknownRecord
+  ): { priceMoney: string; priceText: string } | undefined {
+    const priceObject = this.firstRecord(item, ['price']) || this.firstRecord(product, ['price']);
+    const source = priceObject || offers;
+    const priceMoney = this.firstString(source, ['priceMoney', 'money', 'centPrice']);
+    const priceText = this.firstString(source, ['priceText', 'displayPrice', 'formattedPrice']);
+    const rawPrice = priceMoney || priceText ||
+      this.firstString(offers, ['price', 'lowPrice', 'minPrice']) ||
+      this.firstString(product, ['price', 'lowPrice', 'minPrice']);
+
+    if (!rawPrice) return undefined;
+    const numeric = this.numericPrice(rawPrice);
+    if (numeric === undefined) return undefined;
+    const money = priceMoney ? numeric : Math.round(numeric * 100);
+    return {
+      priceMoney: String(money),
+      priceText: priceText || rawPrice,
+    };
+  }
+
+  private extractOriginalPrice(
+    item: UnknownRecord,
+    product: UnknownRecord,
+    offers: UnknownRecord
+  ): { priceMoney: string; priceText: string } | undefined {
+    const source = this.firstRecord(item, ['originalPrice', 'marketPrice', 'listPrice']) ||
+      this.firstRecord(product, ['originalPrice', 'marketPrice', 'listPrice']);
+    const offerPrice = this.firstString(offers, ['highPrice', 'listPrice', 'marketPrice']);
+    const raw = source
+      ? this.firstString(source, ['priceMoney', 'priceText', 'price'])
+      : offerPrice;
+    if (!raw) return undefined;
+    const numeric = this.numericPrice(raw);
+    if (numeric === undefined) return undefined;
+    const priceMoney = source && this.firstString(source, ['priceMoney', 'priceText'])
+      ? numeric
+      : Math.round(numeric * 100);
+    return { priceMoney: String(priceMoney), priceText: raw };
+  }
+
+  private extractSimpleProps(item: UnknownRecord): Array<{ name: string; value: string }> {
+    return asArray(item.props).filter(isRecord).map(prop => ({
+      name: this.firstString(prop, ['name', 'key', 'label']) || '',
+      value: this.firstString(prop, ['value', 'val', 'text']) || '',
+    })).filter(prop => prop.name && prop.value);
+  }
+
+  private firstRecord(record: UnknownRecord, keys: string[]): UnknownRecord | undefined {
+    for (const key of keys) {
+      if (isRecord(record[key])) return record[key];
+    }
+    return undefined;
+  }
+
+  private firstString(record: UnknownRecord, keys: string[]): string | undefined {
+    for (const key of keys) {
+      const value = asString(record[key]);
+      if (value) return value;
+    }
+    return undefined;
+  }
+
+  private firstNumber(record: UnknownRecord, keys: string[]): number | undefined {
+    for (const key of keys) {
+      const value = record[key];
+      if (typeof value === 'number' && Number.isFinite(value)) return value;
+      if (typeof value === 'string' && value.trim() && Number.isFinite(Number(value))) return Number(value);
+    }
+    return undefined;
+  }
+
+  private numericPrice(value: string): number | undefined {
+    const match = value.replace(/,/g, '').match(/-?\d+(?:\.\d+)?/);
+    if (!match) return undefined;
+    const numeric = Number(match[0]);
+    return Number.isFinite(numeric) ? numeric : undefined;
+  }
+
+  private normalizeEmbeddedUrl(value?: string): string | undefined {
+    if (!value) return undefined;
+    return value.startsWith('http') ? value : `https:${value}`;
+  }
+
   private async isVerificationRequired(): Promise<boolean> {
     if (!this.page) return false;
 
     const currentUrl = this.page.url().toLowerCase();
-    if (
-      currentUrl.includes('login.taobao.com') ||
-      currentUrl.includes('login.tmall.com') ||
-      /captcha|checkcode|x5sec|security/.test(currentUrl)
-    ) {
+    if (this.isLoginUrl() || /captcha|checkcode|x5sec|security/.test(currentUrl)) {
       return true;
     }
 
