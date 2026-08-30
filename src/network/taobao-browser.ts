@@ -66,6 +66,10 @@ export class TaobaoBrowserExtractor {
           persist: true,
         },
         viewport: { width: 1440, height: 1000 },
+        // Browserbase automatically solves supported CAPTCHAs when enabled.
+        // Keep this explicit so the manual fallback only runs after an
+        // automatic attempt has had a chance to complete.
+        solveCaptchas: true,
       },
       keepAlive: true,
     });
@@ -76,13 +80,10 @@ export class TaobaoBrowserExtractor {
 
     this.browserbaseSessionId = session.id;
 
-    const liveView = await this.browserbaseRequest<{
-      debuggerFullscreenUrl: string;
-    }>(`/v1/sessions/${session.id}/debug`, 'GET');
-    if (!liveView.debuggerFullscreenUrl) {
+    this.liveViewUrl = await this.createLiveViewUrl();
+    if (!this.liveViewUrl) {
       throw new Error('Browserbase did not return a debuggerFullscreenUrl');
     }
-    this.liveViewUrl = liveView.debuggerFullscreenUrl;
 
     this.browser = await chromium.connectOverCDP(session.connectUrl);
     this.context = this.browser.contexts()[0];
@@ -93,6 +94,14 @@ export class TaobaoBrowserExtractor {
     this.page = this.context.pages()[0] || await this.context.newPage();
     this.page.on('response', (response) => {
       void this.captureDetailResponse(response);
+    });
+    this.page.on('console', (message) => {
+      const text = message.text();
+      if (text === 'browserbase-solving-started') {
+        logger.info({ sessionId: this.browserbaseSessionId }, 'Browserbase CAPTCHA auto-solver started');
+      } else if (text === 'browserbase-solving-finished') {
+        logger.info({ sessionId: this.browserbaseSessionId }, 'Browserbase CAPTCHA auto-solver finished');
+      }
     });
 
     logger.info(
@@ -147,14 +156,17 @@ export class TaobaoBrowserExtractor {
   }
 
   async close(): Promise<void> {
-    await this.browser?.close();
-    if (this.browserbaseSessionId && this.browserbaseApiKey) {
+    const sessionId = this.browserbaseSessionId;
+    if (sessionId && this.browserbaseApiKey) {
       try {
-        await this.browserbaseRequest(`/v1/sessions/${this.browserbaseSessionId}`, 'POST', {});
+        await this.browserbaseRequest(`/v1/sessions/${sessionId}`, 'POST', {
+          status: 'REQUEST_RELEASE',
+        });
       } catch (err) {
-        logger.warn({ sessionId: this.browserbaseSessionId, err }, 'Browserbase session release failed');
+        logger.warn({ sessionId, err }, 'Browserbase session release failed');
       }
     }
+    await this.browser?.close();
     this.browser = undefined;
     this.context = undefined;
     this.page = undefined;
@@ -204,6 +216,23 @@ export class TaobaoBrowserExtractor {
     return response.json() as Promise<T>;
   }
 
+  private async createLiveViewUrl(): Promise<string | undefined> {
+    if (!this.browserbaseSessionId) return undefined;
+
+    try {
+      const liveView = await this.browserbaseRequest<{
+        debuggerFullscreenUrl?: string;
+      }>(`/v1/sessions/${this.browserbaseSessionId}/debug`, 'GET');
+      return liveView.debuggerFullscreenUrl || undefined;
+    } catch (err) {
+      logger.warn(
+        { sessionId: this.browserbaseSessionId, err },
+        'Unable to create Browserbase Live View URL'
+      );
+      return undefined;
+    }
+  }
+
   private async captureDetailResponse(response: Response): Promise<void> {
     const url = response.url();
     if (!this.isDetailResponse(url) || !this.currentItemId) return;
@@ -242,9 +271,18 @@ export class TaobaoBrowserExtractor {
         verificationWasSeen = true;
         if (!verificationReported) {
           verificationReported = true;
+          // Refresh the URL after navigation so the user receives a Live
+          // View for this exact session and current page, not a stale URL
+          // created before the product page opened.
+          this.liveViewUrl = await this.createLiveViewUrl() || this.liveViewUrl;
           logger.warn(
-            { itemId, sessionId: this.browserbaseSessionId, liveViewUrl: this.liveViewUrl },
-            'Human verification required in the open Taobao browser; complete it manually to resume extraction'
+            {
+              itemId,
+              sessionId: this.browserbaseSessionId,
+              liveViewUrl: this.liveViewUrl,
+              autoSolverEnabled: true,
+            },
+            'CAPTCHA or human verification detected; Browserbase auto-solver is attempting resolution. If it does not finish, use the Live View URL to solve it manually; extraction is paused'
           );
         }
         await this.page.waitForTimeout(1000);
@@ -770,7 +808,9 @@ export class TaobaoBrowserExtractor {
 
     const price = this.toMoneyInCents(visible.priceText);
     const image = visible.image && (visible.image.startsWith('http') ? visible.image : `https:${visible.image}`);
-    const itemUrl = this.page.url();
+    const itemUrl = platform === 'tmall'
+      ? `https://detail.tmall.com/item.htm?id=${itemId}`
+      : `https://item.taobao.com/item.htm?id=${itemId}`;
 
     return {
       itemId,
