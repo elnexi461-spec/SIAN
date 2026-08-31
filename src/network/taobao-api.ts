@@ -1,19 +1,62 @@
 import axios, { AxiosRequestConfig } from 'axios';
 import crypto from 'crypto';
+import { config } from '../config';
 import { logger } from '../logging';
 import { withRetry } from '../retry';
 import { TaobaoItemDetail } from '../types/taobao';
 
 const APP_KEY = '12574478';
+const MTOP_API = 'mtop.taobao.detail.getdetail';
+const MTOP_VERSION = '6.0';
+const MTOP_JSV = '2.6.1';
 const H5_API_URL = 'https://h5api.m.taobao.com/h5/mtop.taobao.detail.getdetail/6.0/';
 
 interface H5Token {
   token: string;
-  cookie: string;
 }
 
 type UnknownRecord = Record<string, unknown>;
 type TaobaoSkuCore = NonNullable<TaobaoItemDetail['skuCore']>;
+
+export function generateMtopSign(token: string, timestamp: string, appKey: string, data: string): string {
+  const signingInput = `${token}&${timestamp}&${appKey}&${data}`;
+  return crypto.createHash('md5').update(signingInput, 'utf8').digest('hex');
+}
+
+export function extractMtopToken(cookieValue: string): string | undefined {
+  const cookieMatch = cookieValue.match(/(?:^|;\s*)_m_h5_tk=([^;]*)/);
+  const rawValue = cookieMatch ? cookieMatch[1] : cookieValue.includes('=') ? undefined : cookieValue;
+  if (!rawValue) return undefined;
+
+  const separatorIndex = rawValue.indexOf('_');
+  const token = (separatorIndex === -1 ? rawValue : rawValue.slice(0, separatorIndex)).trim();
+  return token || undefined;
+}
+
+export function buildMtopDetailRequest(
+  itemId: string,
+  token: string,
+  timestamp: string,
+  appKey: string = APP_KEY
+): { data: string; sign: string; params: URLSearchParams } {
+  const payload = { itemNumId: itemId };
+  const data = JSON.stringify(payload);
+  const sign = generateMtopSign(token, timestamp, appKey, data);
+  const params = new URLSearchParams({
+    jsv: MTOP_JSV,
+    appKey,
+    t: timestamp,
+    sign,
+    api: MTOP_API,
+    v: MTOP_VERSION,
+    type: 'jsonp',
+    dataType: 'jsonp',
+    callback: 'mtopjsonp1',
+    data,
+  });
+
+  return { data, sign, params };
+}
 
 function isRecord(value: unknown): value is UnknownRecord {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -49,7 +92,7 @@ function asDsrType(value: unknown): 'desc' | 'serv' | 'post' | undefined {
 
 export class TaobaoApiClient {
   private session = axios.create({
-    timeout: 15000,
+    timeout: config.requestTimeout,
     headers: {
       'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
       'Accept': '*/*',
@@ -58,7 +101,8 @@ export class TaobaoApiClient {
     },
   });
 
-  private tokenCache: Map<string, H5Token> = new Map();
+  private tokenCache?: H5Token;
+  private sessionCookies: Map<string, string> = new Map();
 
   /**
    * Fetch item detail from Taobao H5 API.
@@ -82,33 +126,18 @@ export class TaobaoApiClient {
         // Step 1: Get or refresh H5 token
         const token = await this.getH5Token(itemId);
 
-        // Step 2: Build request with sign
-        const t = Date.now().toString();
-        const data = JSON.stringify({ itemNumId: itemId });
-        const sign = this.generateSign(token.token, t, APP_KEY, data);
-
-        const params = new URLSearchParams({
-          jsv: '2.6.1',
-          appKey: APP_KEY,
-          t,
-          sign,
-          api: 'mtop.taobao.detail.getdetail',
-          v: '6.0',
-          type: 'jsonp',
-          dataType: 'jsonp',
-          callback: 'mtopjsonp1',
-          data,
-        });
-
-        const url = `${H5_API_URL}?${params.toString()}`;
+        // Step 2: Build the request from one exact serialized payload.
+        const request = buildMtopDetailRequest(itemId, token.token, Date.now().toString());
+        const url = `${H5_API_URL}?${request.params.toString()}`;
 
         const response = await this.session.get(url, {
           headers: {
-            Cookie: token.cookie,
+            Cookie: this.getSessionCookieHeader(),
             'x-requested-with': 'XMLHttpRequest',
           },
           responseType: 'text',
         });
+        this.updateSessionCookies(response.headers['set-cookie']);
 
         const bytesReceived = typeof response.data === 'string' ? response.data.length : JSON.stringify(response.data).length;
 
@@ -122,7 +151,7 @@ export class TaobaoApiClient {
         if (!match) {
           // Check if it's an anti-bot response
           if (jsonp.includes('FAIL_SYS_TOKEN_EXOIRED') || jsonp.includes('令牌过期')) {
-            this.tokenCache.delete(itemId);
+            this.tokenCache = undefined;
             throw new Error('TOKEN_EXPIRED: H5 token expired');
           }
           if (jsonp.includes('FAIL_SYS_TRAFFIC_LIMIT') || jsonp.includes('系统繁忙')) {
@@ -131,7 +160,7 @@ export class TaobaoApiClient {
           if (jsonp.includes('FAIL_SYS_USER_VALIDATE') || jsonp.includes('访问被拒绝')) {
             throw new Error('BLOCKED: User validation required');
           }
-          throw new Error(`Invalid JSONP response: ${jsonp.slice(0, 200)}`);
+          throw new Error('Invalid JSONP response');
         }
 
         const parsed = JSON.parse(match[1]) as unknown;
@@ -143,17 +172,17 @@ export class TaobaoApiClient {
         const retMsg = asString(ret[0]) || 'Unknown error';
         if (!retMsg.includes('SUCCESS')) {
           if (retMsg.includes('TOKEN') || retMsg.includes('令牌')) {
-            this.tokenCache.delete(itemId);
-            throw new Error(`TOKEN_EXPIRED: ${retMsg}`);
+            this.tokenCache = undefined;
+            throw new Error('TOKEN_EXPIRED: H5 token expired');
           }
-          throw new Error(`API error: ${retMsg}`);
+          throw new Error('API error: MTOP request failed');
         }
 
         const detail = this.parseDetailData(itemId, parsed.data);
         return { detail, bytesReceived };
       },
       {
-        maxRetries: 3,
+        maxRetries: config.maxRetries,
         baseDelayMs: 2000,
         maxDelayMs: 15000,
         backoffMultiplier: 2,
@@ -212,8 +241,7 @@ export class TaobaoApiClient {
    * The first request returns a token in the Set-Cookie header.
    */
   private async getH5Token(itemId: string): Promise<H5Token> {
-    const cached = this.tokenCache.get(itemId);
-    if (cached) return cached;
+    if (this.tokenCache) return this.tokenCache;
 
     // Make a dummy request to get the token cookie
     const t = Date.now().toString();
@@ -222,12 +250,12 @@ export class TaobaoApiClient {
     const dummySign = 'a'.repeat(32);
 
     const params = new URLSearchParams({
-      jsv: '2.6.1',
+      jsv: MTOP_JSV,
       appKey: APP_KEY,
       t,
       sign: dummySign,
-      api: 'mtop.taobao.detail.getdetail',
-      v: '6.0',
+      api: MTOP_API,
+      v: MTOP_VERSION,
       type: 'jsonp',
       dataType: 'jsonp',
       callback: 'mtopjsonp1',
@@ -235,37 +263,21 @@ export class TaobaoApiClient {
     });
 
     const url = `${H5_API_URL}?${params.toString()}`;
-    const response = await this.session.get(url, { responseType: 'text' });
+    const response = await this.session.get(url, {
+      headers: {
+        Cookie: this.getSessionCookieHeader(),
+      },
+      responseType: 'text',
+    });
+    this.updateSessionCookies(response.headers['set-cookie']);
 
-    // Extract _m_h5_tk from cookies
-    const setCookie = response.headers['set-cookie'];
-    let cookieStr = '';
-    if (setCookie) {
-      cookieStr = setCookie.map(c => c.split(';')[0]).join('; ');
-    }
-
-    // Also check response body for token hint
-    const tokenMatch = cookieStr.match(/_m_h5_tk=([^_]+)/);
-    if (!tokenMatch) {
+    const token = extractMtopToken(this.sessionCookies.get('_m_h5_tk') || '');
+    if (!token) {
       throw new Error('Failed to obtain H5 token — anti-bot protection may be active');
     }
 
-    const token: H5Token = {
-      token: tokenMatch[1],
-      cookie: cookieStr,
-    };
-
-    this.tokenCache.set(itemId, token);
-    return token;
-  }
-
-  /**
-   * Generate Taobao H5 API sign.
-   * sign = MD5(token + t + appKey + data)
-   */
-  private generateSign(token: string, t: string, appKey: string, data: string): string {
-    const str = token + t + appKey + data;
-    return crypto.createHash('md5').update(str).digest('hex');
+    this.tokenCache = { token };
+    return this.tokenCache;
   }
 
   /**
@@ -426,11 +438,35 @@ export class TaobaoApiClient {
   }
 
   clearCache(): void {
-    this.tokenCache.clear();
+    this.tokenCache = undefined;
+    this.sessionCookies.delete('_m_h5_tk');
   }
 
   private isSecurityChallenge(error?: string): boolean {
     if (!error) return false;
     return /BLOCKED|USER_VALIDATE|X5|验证码|安全验证|访问被拒绝|anti-bot|challenge|captcha/i.test(error);
+  }
+
+  private getSessionCookieHeader(): string {
+    return Array.from(this.sessionCookies.entries())
+      .map(([name, value]) => `${name}=${value}`)
+      .join('; ');
+  }
+
+  private updateSessionCookies(setCookie?: string[]): void {
+    if (!setCookie) return;
+
+    for (const cookie of setCookie) {
+      const pair = cookie.split(';', 1)[0];
+      const separatorIndex = pair.indexOf('=');
+      if (separatorIndex <= 0) continue;
+
+      const name = pair.slice(0, separatorIndex).trim();
+      const value = pair.slice(separatorIndex + 1).trim();
+      this.sessionCookies.set(name, value);
+    }
+
+    const token = extractMtopToken(this.sessionCookies.get('_m_h5_tk') || '');
+    if (token) this.tokenCache = { token };
   }
 }
