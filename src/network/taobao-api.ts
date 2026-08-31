@@ -18,6 +18,45 @@ interface H5Token {
 type UnknownRecord = Record<string, unknown>;
 type TaobaoSkuCore = NonNullable<TaobaoItemDetail['skuCore']>;
 
+export type MtopResponseCategory =
+  | 'SUCCESS'
+  | 'TOKEN_EXPIRED'
+  | 'TOKEN_MISSING'
+  | 'LOGIN_REQUIRED'
+  | 'RISK_CONTROL'
+  | 'RATE_LIMITED'
+  | 'ITEM_UNAVAILABLE'
+  | 'API_ERROR'
+  | 'INVALID_RESPONSE';
+
+export interface ParsedMtopResponse {
+  payload: UnknownRecord;
+  format: 'json' | 'jsonp';
+  callback?: string;
+  retMessages: string[];
+}
+
+export class MtopResponseError extends Error {
+  readonly category: MtopResponseCategory;
+  readonly retMessages: string[];
+  readonly httpStatus?: number;
+
+  constructor(
+    category: MtopResponseCategory,
+    detail: string,
+    retMessages: string[] = [],
+    httpStatus?: number
+  ) {
+    const status = httpStatus === undefined ? '' : ` (HTTP ${httpStatus})`;
+    const label = category === 'RATE_LIMITED' ? 'RATE_LIMITED (rate limit)' : category;
+    super(`${label}: ${redactMtopDiagnostics(detail)}${status}`);
+    this.name = 'MtopResponseError';
+    this.category = category;
+    this.retMessages = retMessages.map(redactMtopDiagnostics);
+    this.httpStatus = httpStatus;
+  }
+}
+
 export function generateMtopSign(token: string, timestamp: string, appKey: string, data: string): string {
   const signingInput = `${token}&${timestamp}&${appKey}&${data}`;
   return crypto.createHash('md5').update(signingInput, 'utf8').digest('hex');
@@ -58,6 +97,121 @@ export function buildMtopDetailRequest(
   return { data, sign, params };
 }
 
+export function parseMtopResponseBody(responseBody: string, httpStatus?: number): ParsedMtopResponse {
+  const trimmed = responseBody.trim();
+  if (!trimmed) {
+    throw new MtopResponseError('INVALID_RESPONSE', 'empty response body', [], httpStatus);
+  }
+
+  const withoutTrailingSemicolon = trimmed.endsWith(';')
+    ? trimmed.slice(0, -1).trim()
+    : trimmed;
+  let jsonText = withoutTrailingSemicolon;
+  let format: 'json' | 'jsonp' = 'json';
+  let callback: string | undefined;
+
+  if (!withoutTrailingSemicolon.startsWith('{')) {
+    const openParen = withoutTrailingSemicolon.indexOf('(');
+    const closeParen = withoutTrailingSemicolon.lastIndexOf(')');
+    callback = withoutTrailingSemicolon.slice(0, openParen).trim();
+    const suffix = closeParen >= 0
+      ? withoutTrailingSemicolon.slice(closeParen + 1).trim()
+      : '';
+
+    if (
+      openParen <= 0 ||
+      closeParen <= openParen ||
+      suffix ||
+      !/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(callback)
+    ) {
+      throw new MtopResponseError('INVALID_RESPONSE', 'invalid JSONP wrapper', [], httpStatus);
+    }
+
+    jsonText = withoutTrailingSemicolon.slice(openParen + 1, closeParen).trim();
+    format = 'jsonp';
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch (error) {
+    const detail = error instanceof SyntaxError
+      ? `malformed JSON (${error.message})`
+      : 'malformed JSON';
+    throw new MtopResponseError('INVALID_RESPONSE', detail, [], httpStatus);
+  }
+
+  if (!isRecord(parsed)) {
+    throw new MtopResponseError('INVALID_RESPONSE', 'JSON body must be an object', [], httpStatus);
+  }
+
+  return {
+    payload: parsed,
+    format,
+    callback,
+    retMessages: getMtopRetMessages(parsed),
+  };
+}
+
+export function classifyMtopResponse(payload: UnknownRecord): MtopResponseCategory {
+  const retMessages = getMtopRetMessages(payload);
+  if (retMessages.length === 0) return 'INVALID_RESPONSE';
+
+  const retText = retMessages.join(' | ').toLowerCase();
+  if (retMessages.some(message => message.toUpperCase().includes('SUCCESS'))) return 'SUCCESS';
+  if (
+    retText.includes('token_expired') ||
+    retText.includes('token expired') ||
+    retText.includes('fail_sys_token_exoired') ||
+    retText.includes('fail_sys_token_expired') ||
+    retText.includes('令牌过期')
+  ) return 'TOKEN_EXPIRED';
+  if (
+    retText.includes('token_missing') ||
+    retText.includes('token missing') ||
+    retText.includes('fail_sys_token_empty') ||
+    retText.includes('token is empty') ||
+    retText.includes('缺少令牌')
+  ) return 'TOKEN_MISSING';
+  if (
+    retText.includes('login_required') ||
+    retText.includes('need_login') ||
+    retText.includes('fail_sys_login') ||
+    retText.includes('login required') ||
+    retText.includes('请先登录')
+  ) return 'LOGIN_REQUIRED';
+  if (
+    retText.includes('rgv587') ||
+    retText.includes('risk control') ||
+    retText.includes('risk_control') ||
+    retText.includes('fail_sys_user_validate') ||
+    retText.includes('blocked') ||
+    retText.includes('captcha') ||
+    retText.includes('验证码') ||
+    retText.includes('安全验证') ||
+    retText.includes('访问被拒绝') ||
+    retText.includes('x5')
+  ) return 'RISK_CONTROL';
+  if (
+    retText.includes('rate limit') ||
+    retText.includes('rate_limited') ||
+    retText.includes('fail_sys_traffic_limit') ||
+    retText.includes('too many requests') ||
+    retText.includes('系统繁忙')
+  ) return 'RATE_LIMITED';
+  if (
+    retText.includes('item_not_found') ||
+    retText.includes('item not found') ||
+    retText.includes('item_not_exist') ||
+    retText.includes('item unavailable') ||
+    retText.includes('商品不存在') ||
+    retText.includes('宝贝不存在') ||
+    retText.includes('已下架')
+  ) return 'ITEM_UNAVAILABLE';
+
+  return 'API_ERROR';
+}
+
 function isRecord(value: unknown): value is UnknownRecord {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -78,6 +232,19 @@ function asString(value: unknown): string | undefined {
   return undefined;
 }
 
+function getMtopRetMessages(payload: UnknownRecord): string[] {
+  return getArray(payload, 'ret')
+    .map(asString)
+    .filter((message): message is string => Boolean(message));
+}
+
+function redactMtopDiagnostics(value: string): string {
+  return value
+    .replace(/(_m_h5_tk(?:_enc)?\s*[=:]\s*)[^;\s,)}]+/gi, '$1[REDACTED]')
+    .replace(/((?:cookie|authorization|session[-_ ]?token|access[-_ ]?token|token)\s*[=:]\s*)[^;\s,)}]+/gi, '$1[REDACTED]')
+    .replace(/(bearer\s+)[^\s,;)}]+/gi, '$1[REDACTED]');
+}
+
 function asNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
@@ -88,6 +255,26 @@ function asSellerType(value: unknown): 'B' | 'C' | undefined {
 
 function asDsrType(value: unknown): 'desc' | 'serv' | 'post' | undefined {
   return value === 'desc' || value === 'serv' || value === 'post' ? value : undefined;
+}
+
+function createMtopResponseError(payload: UnknownRecord, httpStatus: number): MtopResponseError | undefined {
+  const retMessages = getMtopRetMessages(payload);
+  const category = classifyMtopResponse(payload);
+  if (category === 'SUCCESS' && httpStatus === 200) return undefined;
+
+  const effectiveCategory = category === 'SUCCESS' ? 'API_ERROR' : category;
+  const detail = retMessages.length > 0
+    ? retMessages.join(' | ')
+    : `HTTP ${httpStatus} response did not contain a valid MTOP status`;
+  return new MtopResponseError(effectiveCategory, detail, retMessages, httpStatus);
+}
+
+function isPermanentMtopCategory(category: MtopResponseCategory): boolean {
+  return category === 'LOGIN_REQUIRED' ||
+    category === 'RISK_CONTROL' ||
+    category === 'ITEM_UNAVAILABLE' ||
+    category === 'API_ERROR' ||
+    category === 'INVALID_RESPONSE';
 }
 
 export class TaobaoApiClient {
@@ -123,63 +310,42 @@ export class TaobaoApiClient {
 
     const result = await withRetry(
       async () => {
-        // Step 1: Get or refresh H5 token
-        const token = await this.getH5Token(itemId);
+        try {
+          // Step 1: Get or refresh H5 token
+          const token = await this.getH5Token(itemId);
 
-        // Step 2: Build the request from one exact serialized payload.
-        const request = buildMtopDetailRequest(itemId, token.token, Date.now().toString());
-        const url = `${H5_API_URL}?${request.params.toString()}`;
+          // Step 2: Build the request from one exact serialized payload.
+          const request = buildMtopDetailRequest(itemId, token.token, Date.now().toString());
+          const url = `${H5_API_URL}?${request.params.toString()}`;
 
-        const response = await this.session.get(url, {
-          headers: {
-            Cookie: this.getSessionCookieHeader(),
-            'x-requested-with': 'XMLHttpRequest',
-          },
-          responseType: 'text',
-        });
-        this.updateSessionCookies(response.headers['set-cookie']);
+          const response = await this.session.get(url, {
+            headers: {
+              Cookie: this.getSessionCookieHeader(),
+              'x-requested-with': 'XMLHttpRequest',
+            },
+            responseType: 'text',
+            validateStatus: () => true,
+          });
+          this.updateSessionCookies(response.headers['set-cookie']);
 
-        const bytesReceived = typeof response.data === 'string' ? response.data.length : JSON.stringify(response.data).length;
-
-        if (response.status !== 200) {
-          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
-
-        // Parse JSONP: mtopjsonp1({...})
-        const jsonp = typeof response.data === 'string' ? response.data : String(response.data);
-        const match = jsonp.match(/^mtopjsonp1\((.*)\)$/s);
-        if (!match) {
-          // Check if it's an anti-bot response
-          if (jsonp.includes('FAIL_SYS_TOKEN_EXOIRED') || jsonp.includes('令牌过期')) {
-            this.tokenCache = undefined;
-            throw new Error('TOKEN_EXPIRED: H5 token expired');
+          const bytesReceived = typeof response.data === 'string' ? response.data.length : JSON.stringify(response.data).length;
+          const jsonp = typeof response.data === 'string' ? response.data : String(response.data);
+          const parsed = parseMtopResponseBody(jsonp, response.status);
+          const responseError = createMtopResponseError(parsed.payload, response.status);
+          if (responseError) {
+            if (responseError.category === 'TOKEN_EXPIRED') this.tokenCache = undefined;
+            throw responseError;
           }
-          if (jsonp.includes('FAIL_SYS_TRAFFIC_LIMIT') || jsonp.includes('系统繁忙')) {
-            throw new Error('RATE_LIMIT: Traffic limit');
-          }
-          if (jsonp.includes('FAIL_SYS_USER_VALIDATE') || jsonp.includes('访问被拒绝')) {
-            throw new Error('BLOCKED: User validation required');
-          }
-          throw new Error('Invalid JSONP response');
-        }
 
-        const parsed = JSON.parse(match[1]) as unknown;
-        if (!isRecord(parsed)) {
-          throw new Error('Invalid JSONP payload');
-        }
-
-        const ret = getArray(parsed, 'ret');
-        const retMsg = asString(ret[0]) || 'Unknown error';
-        if (!retMsg.includes('SUCCESS')) {
-          if (retMsg.includes('TOKEN') || retMsg.includes('令牌')) {
-            this.tokenCache = undefined;
-            throw new Error('TOKEN_EXPIRED: H5 token expired');
+          const detail = this.parseDetailData(itemId, parsed.payload.data);
+          return { detail, bytesReceived };
+        } catch (error) {
+          if (error instanceof MtopResponseError) {
+            if (error.category === 'TOKEN_EXPIRED') this.tokenCache = undefined;
+            if (isPermanentMtopCategory(error.category)) return { error };
           }
-          throw new Error('API error: MTOP request failed');
+          throw error;
         }
-
-        const detail = this.parseDetailData(itemId, parsed.data);
-        return { detail, bytesReceived };
       },
       {
         maxRetries: config.maxRetries,
@@ -191,6 +357,20 @@ export class TaobaoApiClient {
     );
 
     const latencyMs = Date.now() - startTime;
+
+    if (result.success && result.result && 'error' in result.result) {
+      const error = result.result.error;
+      if (error instanceof MtopResponseError) {
+        return {
+          success: false,
+          statusCode: error.httpStatus,
+          latencyMs,
+          retries: result.retries,
+          error: error.message,
+          requiresBrowser: this.isSecurityChallenge(error.message),
+        };
+      }
+    }
 
     if (!result.success) {
       const error = result.error?.message;
@@ -219,18 +399,10 @@ export class TaobaoApiClient {
    * client's fixed callback, so accept either JSON or any JSONP wrapper.
    */
   parseBrowserDetailResponse(itemId: string, responseBody: string): TaobaoItemDetail | undefined {
-    const trimmed = responseBody.trim();
-    const jsonText = trimmed.startsWith('{') || trimmed.startsWith('[')
-      ? trimmed
-      : trimmed.replace(/^[^(]+\(/, '').replace(/\)\s*;?\s*$/, '');
-
     try {
-      const parsed = JSON.parse(jsonText) as unknown;
-      if (!isRecord(parsed)) return undefined;
-      const ret = getArray(parsed, 'ret');
-      const retMsg = asString(ret[0]) || '';
-      if (retMsg && !retMsg.includes('SUCCESS')) return undefined;
-      return this.parseDetailData(itemId, parsed.data);
+      const parsed = parseMtopResponseBody(responseBody);
+      if (parsed.retMessages.length > 0 && classifyMtopResponse(parsed.payload) !== 'SUCCESS') return undefined;
+      return this.parseDetailData(itemId, parsed.payload.data);
     } catch {
       return undefined;
     }
@@ -444,7 +616,7 @@ export class TaobaoApiClient {
 
   private isSecurityChallenge(error?: string): boolean {
     if (!error) return false;
-    return /BLOCKED|USER_VALIDATE|X5|验证码|安全验证|访问被拒绝|anti-bot|challenge|captcha/i.test(error);
+    return /RISK_CONTROL|RGV587|BLOCKED|USER_VALIDATE|X5|验证码|安全验证|访问被拒绝|anti-bot|challenge|captcha/i.test(error);
   }
 
   private getSessionCookieHeader(): string {
