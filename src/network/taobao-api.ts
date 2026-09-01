@@ -15,6 +15,11 @@ interface H5Token {
   token: string;
 }
 
+export interface TaobaoSessionProvider {
+  getCookieHeader(): Promise<string>;
+  refresh(): Promise<void>;
+}
+
 type UnknownRecord = Record<string, unknown>;
 type TaobaoSkuCore = NonNullable<TaobaoItemDetail['skuCore']>;
 
@@ -294,6 +299,22 @@ export class TaobaoApiClient {
 
   private tokenCache?: H5Token;
   private sessionCookies: Map<string, string> = new Map();
+  private externalSessionConfigured = false;
+  private sessionProvider?: TaobaoSessionProvider;
+
+  constructor(sessionProvider?: TaobaoSessionProvider) {
+    this.sessionProvider = sessionProvider;
+    const cookieHeader = process.env.TAOBAO_COOKIE_HEADER;
+    if (cookieHeader !== undefined) {
+      this.externalSessionConfigured = true;
+      this.initializeSessionCookies(cookieHeader);
+    }
+  }
+
+  setSessionProvider(sessionProvider?: TaobaoSessionProvider): void {
+    this.sessionProvider = sessionProvider;
+    this.tokenCache = undefined;
+  }
 
   /**
    * Fetch item detail from Taobao H5 API.
@@ -311,9 +332,11 @@ export class TaobaoApiClient {
     bytesReceived?: number;
   }> {
     const startTime = Date.now();
+    let browserRefreshAttempted = false;
 
     const result = await withRetry(
       async () => {
+        let browserRefreshPerformed = false;
         try {
           // Step 1: Get or refresh H5 token
           const token = await this.getH5Token(itemId);
@@ -337,7 +360,19 @@ export class TaobaoApiClient {
           const parsed = parseMtopResponseBody(jsonp, response.status);
           const responseError = createMtopResponseError(parsed.payload, response.status);
           if (responseError) {
-            if (responseError.category === 'TOKEN_EXPIRED') this.tokenCache = undefined;
+            if (
+              this.sessionProvider &&
+              (responseError.category === 'TOKEN_EXPIRED' || responseError.category === 'TOKEN_MISSING') &&
+              !browserRefreshAttempted
+            ) {
+              browserRefreshAttempted = true;
+              browserRefreshPerformed = true;
+              this.tokenCache = undefined;
+              await this.sessionProvider.refresh();
+              await this.loadSessionFromProvider();
+            } else if (responseError.category === 'TOKEN_EXPIRED') {
+              this.tokenCache = undefined;
+            }
             throw responseError;
           }
 
@@ -345,7 +380,17 @@ export class TaobaoApiClient {
           return { detail, bytesReceived };
         } catch (error) {
           if (error instanceof MtopResponseError) {
-            if (error.category === 'TOKEN_EXPIRED') this.tokenCache = undefined;
+            if (
+              this.sessionProvider &&
+              browserRefreshAttempted &&
+              !browserRefreshPerformed &&
+              (error.category === 'TOKEN_EXPIRED' || error.category === 'TOKEN_MISSING')
+            ) {
+              return { error };
+            }
+            if (error.category === 'TOKEN_EXPIRED') {
+              this.tokenCache = undefined;
+            }
             if (isPermanentMtopCategory(error.category)) return { error };
           }
           throw error;
@@ -417,7 +462,24 @@ export class TaobaoApiClient {
    * The first request returns a token in the Set-Cookie header.
    */
   private async getH5Token(itemId: string): Promise<H5Token> {
+    if (this.sessionProvider) {
+      await this.loadSessionFromProvider();
+      const token = extractMtopToken(this.sessionCookies.get('_m_h5_tk') || '');
+      if (token) {
+        this.tokenCache = { token };
+        return this.tokenCache;
+      }
+      throw new Error('Configured Taobao browser session is missing a valid _m_h5_tk token');
+    }
     if (this.tokenCache) return this.tokenCache;
+    if (this.externalSessionConfigured) {
+      const token = extractMtopToken(this.sessionCookies.get('_m_h5_tk') || '');
+      if (token) {
+        this.tokenCache = { token };
+        return this.tokenCache;
+      }
+      throw new Error('Configured Taobao session is missing a valid _m_h5_tk token');
+    }
 
     // Make a dummy request to get the token cookie
     const t = Date.now().toString();
@@ -646,6 +708,29 @@ export class TaobaoApiClient {
     return Array.from(this.sessionCookies.entries())
       .map(([name, value]) => `${name}=${value}`)
       .join('; ');
+  }
+
+  private initializeSessionCookies(cookieHeader: string): void {
+    this.sessionCookies.clear();
+    for (const segment of cookieHeader.split(';')) {
+      const trimmedSegment = segment.trim();
+      const separatorIndex = trimmedSegment.indexOf('=');
+      if (separatorIndex <= 0) continue;
+
+      const name = trimmedSegment.slice(0, separatorIndex).trim();
+      if (!name) continue;
+      const value = trimmedSegment.slice(separatorIndex + 1).trim();
+      this.sessionCookies.set(name, value);
+    }
+
+    const token = extractMtopToken(this.sessionCookies.get('_m_h5_tk') || '');
+    if (token) this.tokenCache = { token };
+  }
+
+  private async loadSessionFromProvider(): Promise<void> {
+    if (!this.sessionProvider) return;
+    const cookieHeader = await this.sessionProvider.getCookieHeader();
+    this.initializeSessionCookies(cookieHeader);
   }
 
   private updateSessionCookies(setCookie?: string[]): void {

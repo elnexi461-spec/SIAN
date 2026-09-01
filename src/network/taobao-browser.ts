@@ -4,6 +4,7 @@ import { randomUUID } from 'crypto';
 import path from 'path';
 import { logger } from '../logging';
 import { TaobaoApiClient } from './taobao-api';
+import type { TaobaoSessionProvider } from './taobao-api';
 import { TaobaoItemDetail } from '../types/taobao';
 
 type UnknownRecord = Record<string, unknown>;
@@ -39,6 +40,7 @@ export class TaobaoBrowserExtractor {
   private context?: BrowserContext;
   private page?: Page;
   private currentItemId?: string;
+  private currentPlatform?: 'taobao' | 'tmall';
   private capturedResponses = new Map<string, string[]>();
   private readonly apiParser = new TaobaoApiClient();
   private browserbaseSessionId?: string;
@@ -117,16 +119,7 @@ export class TaobaoBrowserExtractor {
   async extract(itemId: string, platform: 'taobao' | 'tmall'): Promise<TaobaoBrowserExtraction | undefined> {
     if (!this.page) throw new Error('Taobao browser not initialized');
 
-    this.currentItemId = itemId;
-    this.capturedResponses.delete(itemId);
-    const url = platform === 'tmall'
-      ? `https://detail.tmall.com/item.htm?id=${itemId}`
-      : `https://item.taobao.com/item.htm?id=${itemId}`;
-
-    logger.info({ itemId, url }, 'Opening real Taobao product page');
-    await this.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-
-    await this.waitForVerificationAndProduct(itemId);
+    await this.prepareSession(itemId, platform);
 
     const responseBodies = this.capturedResponses.get(itemId) || [];
     for (const body of responseBodies) {
@@ -153,6 +146,39 @@ export class TaobaoBrowserExtractor {
 
     logger.warn({ itemId }, 'Taobao browser page contained no usable product data');
     return undefined;
+  }
+
+  createSessionProvider(): TaobaoSessionProvider {
+    return {
+      getCookieHeader: async () => this.getSessionCookieHeader(),
+      refresh: async () => this.refreshSession(),
+    };
+  }
+
+  async prepareSession(itemId: string, platform: 'taobao' | 'tmall'): Promise<void> {
+    if (!this.page) throw new Error('Taobao browser not initialized');
+
+    this.currentItemId = itemId;
+    this.currentPlatform = platform;
+    this.capturedResponses.delete(itemId);
+    const url = platform === 'tmall'
+      ? `https://detail.tmall.com/item.htm?id=${itemId}`
+      : `https://item.taobao.com/item.htm?id=${itemId}`;
+
+    logger.info({ itemId, url }, 'Opening real Taobao product page');
+    await this.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await this.waitForVerificationAndProduct(itemId);
+  }
+
+  async refreshSession(): Promise<void> {
+    if (!this.page) throw new Error('Taobao browser not initialized');
+
+    if (this.currentItemId && this.currentPlatform) {
+      await this.prepareSession(this.currentItemId, this.currentPlatform);
+      return;
+    }
+
+    await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 });
   }
 
   async close(): Promise<void> {
@@ -840,6 +866,15 @@ export class TaobaoBrowserExtractor {
     if (!match) return undefined;
     const amount = Number(match[1]);
     return Number.isFinite(amount) ? { money: String(Math.round(amount * 100)) } : undefined;
+  }
+
+  private async getSessionCookieHeader(): Promise<string> {
+    if (!this.context) throw new Error('Taobao browser not initialized');
+
+    const cookies = await this.context.cookies('https://h5api.m.taobao.com');
+    return cookies
+      .map(cookie => `${cookie.name}=${cookie.value}`)
+      .join('; ');
   }
 
   private isDetailResponse(url: string): boolean {

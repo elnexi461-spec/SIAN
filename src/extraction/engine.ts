@@ -18,7 +18,8 @@ export class ExtractionEngine {
   private taobaoApi: TaobaoApiClient;
   private taobaoReviews: TaobaoReviewClient;
   private browserExtractor?: BrowserInterceptExtractor;
-  private taobaoBrowserExtractor?: TaobaoBrowserExtractor;
+  private taobaoBrowserExtractor: TaobaoBrowserExtractor;
+  private taobaoBrowserInitialization?: Promise<void>;
   private validator: ResponseValidator;
   private normalizer: ProductNormalizer;
   private taobaoNormalizer: TaobaoNormalizer;
@@ -27,6 +28,7 @@ export class ExtractionEngine {
     this.directApi = new DirectApiClient();
     this.taobaoApi = new TaobaoApiClient();
     this.taobaoReviews = new TaobaoReviewClient();
+    this.taobaoBrowserExtractor = new TaobaoBrowserExtractor();
     this.validator = new ResponseValidator();
     this.normalizer = new ProductNormalizer();
     this.taobaoNormalizer = new TaobaoNormalizer();
@@ -114,6 +116,14 @@ export class ExtractionEngine {
     const recordId = generateId();
     const startTime = Date.now();
 
+    if (process.env.BROWSERBASE_API_KEY) {
+      try {
+        await this.prepareTaobaoBrowserSession(itemId, platform);
+      } catch (err) {
+        logger.warn({ itemId, err }, 'Taobao browser session preparation failed; using existing direct session behavior');
+      }
+    }
+
     // Step 1: Fetch item detail from H5 API
     const detailResult = await this.taobaoApi.fetchItemDetail(itemId);
 
@@ -163,10 +173,7 @@ export class ExtractionEngine {
     retries: number
   ): Promise<ScrapedRecord | null> {
     try {
-      if (!this.taobaoBrowserExtractor) {
-        this.taobaoBrowserExtractor = new TaobaoBrowserExtractor();
-        await this.taobaoBrowserExtractor.initialize();
-      }
+      await this.ensureTaobaoBrowserInitialized();
 
       const browserResult = await this.taobaoBrowserExtractor.extract(itemId, platform);
       if (!browserResult) return null;
@@ -192,6 +199,22 @@ export class ExtractionEngine {
       logger.error({ itemId, err }, 'Taobao browser extraction failed');
       return null;
     }
+  }
+
+  private async ensureTaobaoBrowserInitialized(): Promise<void> {
+    if (!this.taobaoBrowserInitialization) {
+      this.taobaoBrowserInitialization = this.taobaoBrowserExtractor.initialize();
+    }
+    await this.taobaoBrowserInitialization;
+  }
+
+  private async prepareTaobaoBrowserSession(
+    itemId: string,
+    platform: 'taobao' | 'tmall'
+  ): Promise<void> {
+    await this.ensureTaobaoBrowserInitialized();
+    await this.taobaoBrowserExtractor.prepareSession(itemId, platform);
+    this.taobaoApi.setSessionProvider(this.taobaoBrowserExtractor.createSessionProvider());
   }
 
   private async buildTaobaoRecord(
@@ -242,6 +265,7 @@ export class ExtractionEngine {
   async shutdown(): Promise<void> {
     await this.browserExtractor?.close();
     await this.taobaoBrowserExtractor?.close();
+    this.taobaoApi.setSessionProvider(undefined);
     this.taobaoApi.clearCache();
   }
 }

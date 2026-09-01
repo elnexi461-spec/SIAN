@@ -9,12 +9,27 @@ import {
   parseMtopResponseBody,
 } from '../src/network/taobao-api';
 import { TaobaoNormalizer } from '../src/normalization/taobao-normalizer';
+import { TaobaoBrowserExtractor } from '../src/network/taobao-browser';
 import { logger } from '../src/logging';
 import {
   taobao118SkuFixture,
   taobaoNoSkuFixture,
   taobaoSkuFixture,
 } from './fixtures/taobao-sku-fixture';
+
+const originalTaobaoCookieHeader = process.env.TAOBAO_COOKIE_HEADER;
+
+beforeEach(() => {
+  delete process.env.TAOBAO_COOKIE_HEADER;
+});
+
+afterEach(() => {
+  if (originalTaobaoCookieHeader === undefined) {
+    delete process.env.TAOBAO_COOKIE_HEADER;
+  } else {
+    process.env.TAOBAO_COOKIE_HEADER = originalTaobaoCookieHeader;
+  }
+});
 
 describe('Taobao MTOP session and signing', () => {
   it('generates the expected lowercase UTF-8 MD5 signature', () => {
@@ -331,5 +346,228 @@ describe('Taobao SKU extraction and normalization', () => {
       expect(sku.price).toBeCloseTo(expectedPrice, 10);
       expect(sku.stock).toBe(expectedStock);
     });
+  });
+});
+
+describe('Taobao external session cookies', () => {
+  const originalCookieHeader = process.env.TAOBAO_COOKIE_HEADER;
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+    if (originalCookieHeader === undefined) {
+      delete process.env.TAOBAO_COOKIE_HEADER;
+    } else {
+      process.env.TAOBAO_COOKIE_HEADER = originalCookieHeader;
+    }
+  });
+
+  it('skips anonymous bootstrap, propagates cookies, and signs with the extracted token', async () => {
+    process.env.TAOBAO_COOKIE_HEADER =
+      '_m_h5_tk=browser-token_1700000000; _m_h5_tk_enc=browser-encoded; sid=browser-session';
+    const get = jest.fn().mockResolvedValue({
+      status: 200,
+      headers: { 'set-cookie': [] },
+      data: 'mtopjsonp1({"ret":["SUCCESS::SUCCESS"],"data":{}})',
+    });
+    const client = new TaobaoApiClient() as any;
+    client.session = { get };
+
+    const result = await client.fetchItemDetail('908912749472');
+    const [requestUrl, requestOptions] = get.mock.calls[0];
+    const params = new URL(requestUrl).searchParams;
+
+    expect(result.success).toBe(true);
+    expect(get).toHaveBeenCalledTimes(1);
+    expect(requestOptions.headers.Cookie).toBe(
+      '_m_h5_tk=browser-token_1700000000; _m_h5_tk_enc=browser-encoded; sid=browser-session'
+    );
+    expect(params.get('sign')).toBe(
+      generateMtopSign(
+        'browser-token',
+        params.get('t') || '',
+        '12574478',
+        '{"itemNumId":"908912749472"}'
+      )
+    );
+  });
+
+  it('ignores malformed cookie segments while preserving values after the first equals sign', async () => {
+    process.env.TAOBAO_COOKIE_HEADER =
+      'malformed; =discarded; _m_h5_tk=browser-token_1700000000; sid=browser=session=value; trailing';
+    const get = jest.fn().mockResolvedValue({
+      status: 200,
+      headers: { 'set-cookie': [] },
+      data: 'mtopjsonp1({"ret":["SUCCESS::SUCCESS"],"data":{}})',
+    });
+    const client = new TaobaoApiClient() as any;
+    client.session = { get };
+
+    await client.fetchItemDetail('908912749472');
+
+    expect(get).toHaveBeenCalledTimes(1);
+    expect(get.mock.calls[0][1].headers.Cookie).toBe(
+      '_m_h5_tk=browser-token_1700000000; sid=browser=session=value'
+    );
+  });
+
+  it('returns a safe token-session error without bootstrapping when _m_h5_tk is missing', async () => {
+    process.env.TAOBAO_COOKIE_HEADER = 'sid=browser-session; _m_h5_tk_enc=browser-encoded';
+    const get = jest.fn();
+    const client = new TaobaoApiClient() as any;
+    client.session = { get };
+
+    await expect(client.getH5Token('908912749472')).rejects.toThrow(
+      'Configured Taobao session is missing a valid _m_h5_tk token'
+    );
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it('preserves anonymous bootstrap behavior when TAOBAO_COOKIE_HEADER is absent', async () => {
+    delete process.env.TAOBAO_COOKIE_HEADER;
+    const get = jest.fn()
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: {
+          'set-cookie': ['_m_h5_tk=bootstrap-token_1700000000; Path=/'],
+        },
+        data: '',
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: { 'set-cookie': [] },
+        data: 'mtopjsonp1({"ret":["SUCCESS::SUCCESS"],"data":{}})',
+      });
+    const client = new TaobaoApiClient() as any;
+    client.session = { get };
+
+    const result = await client.fetchItemDetail('908912749472');
+
+    expect(result.success).toBe(true);
+    expect(get).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not bootstrap after an external-session detail failure', async () => {
+    process.env.TAOBAO_COOKIE_HEADER = '_m_h5_tk=browser-token_1700000000; sid=browser-session';
+    const get = jest.fn().mockResolvedValue({
+      status: 200,
+      headers: { 'set-cookie': [] },
+      data: 'mtopjsonp1({"ret":["FAIL_SYS_USER_VALIDATE::risk control"]})',
+    });
+    const client = new TaobaoApiClient() as any;
+    client.session = { get };
+
+    const result = await client.fetchItemDetail('908912749472');
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('RISK_CONTROL');
+    expect(get).toHaveBeenCalledTimes(1);
+  });
+
+  it('consumes cookies from an injected session provider', async () => {
+    delete process.env.TAOBAO_COOKIE_HEADER;
+    const provider = {
+      getCookieHeader: jest.fn().mockResolvedValue(
+        '_m_h5_tk=provider-token_1700000000; _m_h5_tk_enc=provider-encoded; sid=provider-session'
+      ),
+      refresh: jest.fn(),
+    };
+    const get = jest.fn().mockResolvedValue({
+      status: 200,
+      headers: { 'set-cookie': [] },
+      data: 'mtopjsonp1({"ret":["SUCCESS::SUCCESS"],"data":{}})',
+    });
+    const client = new TaobaoApiClient(provider) as any;
+    client.session = { get };
+
+    const result = await client.fetchItemDetail('908912749472');
+
+    expect(result.success).toBe(true);
+    expect(provider.getCookieHeader).toHaveBeenCalled();
+    expect(provider.refresh).not.toHaveBeenCalled();
+    expect(get.mock.calls[0][1].headers.Cookie).toBe(
+      '_m_h5_tk=provider-token_1700000000; _m_h5_tk_enc=provider-encoded; sid=provider-session'
+    );
+  });
+
+  it('refreshes the browser session and retries once after token expiry', async () => {
+    delete process.env.TAOBAO_COOKIE_HEADER;
+    const provider = {
+      getCookieHeader: jest.fn()
+        .mockResolvedValueOnce('_m_h5_tk=expired-token_1700000000; _m_h5_tk_enc=expired-encoded')
+        .mockResolvedValueOnce('_m_h5_tk=fresh-token_1800000000; _m_h5_tk_enc=fresh-encoded')
+        .mockResolvedValueOnce('_m_h5_tk=fresh-token_1800000000; _m_h5_tk_enc=fresh-encoded'),
+      refresh: jest.fn().mockResolvedValue(undefined),
+    };
+    const get = jest.fn()
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: { 'set-cookie': [] },
+        data: 'mtopjsonp1({"ret":["FAIL_SYS_TOKEN_EXPIRED::token expired"]})',
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: { 'set-cookie': [] },
+        data: 'mtopjsonp1({"ret":["SUCCESS::SUCCESS"],"data":{}})',
+      });
+    const client = new TaobaoApiClient(provider) as any;
+    client.session = { get };
+
+    const result = await client.fetchItemDetail('908912749472');
+
+    expect(result.success).toBe(true);
+    expect(result.retries).toBe(1);
+    expect(get).toHaveBeenCalledTimes(2);
+    expect(provider.refresh).toHaveBeenCalledTimes(1);
+    expect(provider.getCookieHeader).toHaveBeenCalledTimes(3);
+    expect(get.mock.calls[1][1].headers.Cookie).toContain('_m_h5_tk=fresh-token_1800000000');
+  });
+
+  it('stops after one provider refresh retry when the refreshed token is still expired', async () => {
+    delete process.env.TAOBAO_COOKIE_HEADER;
+    const provider = {
+      getCookieHeader: jest.fn()
+        .mockResolvedValue('_m_h5_tk=expired-token_1700000000; _m_h5_tk_enc=expired-encoded'),
+      refresh: jest.fn().mockResolvedValue(undefined),
+    };
+    const get = jest.fn()
+      .mockResolvedValue({
+        status: 200,
+        headers: { 'set-cookie': [] },
+        data: 'mtopjsonp1({"ret":["FAIL_SYS_TOKEN_EXPIRED::token expired"]})',
+      });
+    const client = new TaobaoApiClient(provider) as any;
+    client.session = { get };
+
+    const result = await client.fetchItemDetail('908912749472');
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('TOKEN_EXPIRED');
+    expect(result.retries).toBe(1);
+    expect(get).toHaveBeenCalledTimes(2);
+    expect(provider.refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not expose external cookie or token values in errors or diagnostics', async () => {
+    const secretToken = 'synthetic-external-token';
+    const secretEncodedCookie = 'synthetic-encoded-cookie';
+    const secretCookieHeader =
+      `_m_h5_tk=${secretToken}_1700000000; _m_h5_tk_enc=${secretEncodedCookie}; sid=synthetic-session`;
+    process.env.TAOBAO_COOKIE_HEADER = secretCookieHeader;
+    const logSpy = jest.spyOn(logger, 'error').mockImplementation(() => undefined);
+    const get = jest.fn().mockResolvedValue({
+      status: 200,
+      headers: { 'set-cookie': [] },
+      data: `mtopjsonp1({"ret":["FAIL_SYS_USER_VALIDATE::_m_h5_tk=${secretToken}_1700000000; _m_h5_tk_enc=${secretEncodedCookie}"]})`,
+    });
+    const client = new TaobaoApiClient() as any;
+    client.session = { get };
+
+    const result = await client.fetchItemDetail('908912749472');
+
+    expect(result.error).toContain('RISK_CONTROL');
+    expect(result.error).not.toContain(secretToken);
+    expect(result.error).not.toContain(secretEncodedCookie);
+    expect(JSON.stringify(logSpy.mock.calls)).not.toContain(secretToken);
+    expect(JSON.stringify(logSpy.mock.calls)).not.toContain(secretEncodedCookie);
   });
 });
