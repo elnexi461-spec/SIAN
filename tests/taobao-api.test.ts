@@ -8,7 +8,13 @@ import {
   MtopResponseError,
   parseMtopResponseBody,
 } from '../src/network/taobao-api';
+import { TaobaoNormalizer } from '../src/normalization/taobao-normalizer';
 import { logger } from '../src/logging';
+import {
+  taobao118SkuFixture,
+  taobaoNoSkuFixture,
+  taobaoSkuFixture,
+} from './fixtures/taobao-sku-fixture';
 
 describe('Taobao MTOP session and signing', () => {
   it('generates the expected lowercase UTF-8 MD5 signature', () => {
@@ -261,5 +267,69 @@ describe('Taobao MTOP response parsing and classification', () => {
     expect(result.error).toContain('RISK_CONTROL');
     expect(result.error).not.toContain(secretToken);
     expect(result.error).not.toContain(secretCookie);
+  });
+});
+
+describe('Taobao SKU extraction and normalization', () => {
+  const normalizer = new TaobaoNormalizer();
+
+  it('preserves multi-dimensional properties, IDs, prices, stock, and SKU images', () => {
+    const client = new TaobaoApiClient() as any;
+    const detail = client.parseDetailData('fixture-item', taobaoSkuFixture);
+    const normalized = normalizer.normalize('fixture-item', detail);
+
+    expect(detail.skuBase.props.map((prop: any) => prop.name)).toEqual(['颜色', '尺码', '材质']);
+    expect(detail.skuBase.props[0].values.map((value: any) => value.name)).toEqual(['黑色', '白色']);
+    expect(normalized.skus).toHaveLength(5);
+    expect(normalized.skus.map(sku => sku.skuId)).toEqual([
+      '900001',
+      '900002',
+      '900003',
+      '900004',
+      '900005',
+    ]);
+    expect(normalized.skus[0].propertiesName).toBe('颜色:黑色;尺码:M;材质:棉');
+    expect(normalized.skus[1].propertiesName).toBe('颜色:白色;尺码:L;材质:麻');
+    expect(normalized.skus[0].properties).toBe('100:200;101:300;102:400');
+    expect(normalized.skus[0].price).toBe(12.5);
+    expect(normalized.skus[1].price).toBe(19.9);
+    expect(normalized.skus[2].price).toBe(19.9);
+    expect(normalized.skus[3].price).toBe(15);
+    expect(normalized.skus[4].price).toBe(19.9);
+    expect(normalized.originalPrice).toBe(29.9);
+    expect(normalized.skus.map(sku => sku.stock)).toEqual([7, 3, 0, null, null]);
+    expect(normalized.skus[0].image).toBe('https://img.example.test/sku-900001.jpg');
+    expect(normalized.skus[1].image).toBe('https://img.example.test/white.jpg');
+  });
+
+  it('does not fabricate a default SKU for a product without a SKU matrix', () => {
+    const client = new TaobaoApiClient() as any;
+    const detail = client.parseDetailData('no-sku-item', taobaoNoSkuFixture);
+    const normalized = normalizer.normalize('no-sku-item', detail);
+
+    expect(detail.skuBase.skus).toEqual([]);
+    expect(normalized.skus).toEqual([]);
+    expect(normalized.price).toBe(7.25);
+  });
+
+  it('keeps all 118 fixture SKU records with their IDs, properties, prices, and stock', () => {
+    const client = new TaobaoApiClient() as any;
+    const detail = client.parseDetailData('fixture-118-item', taobao118SkuFixture);
+    const normalized = normalizer.normalize('fixture-118-item', detail);
+
+    expect(normalized.skus).toHaveLength(118);
+    normalized.skus.forEach((sku, index) => {
+      const expectedSkuId = String(910000000000 + index);
+      const expectedPrice = 10 + index / 100;
+      const expectedStock = 100 - index;
+
+      expect(sku.skuId).toBe(expectedSkuId);
+      expect(sku.properties).toBe(
+        `100:${200 + (index % 2)};101:${300 + (index % 2)};102:${400 + (index % 2)}`
+      );
+      expect(sku.propertiesName).toMatch(/^颜色:(黑色|白色);尺码:(M|L);材质:(棉|麻)$/);
+      expect(sku.price).toBeCloseTo(expectedPrice, 10);
+      expect(sku.stock).toBe(expectedStock);
+    });
   });
 });

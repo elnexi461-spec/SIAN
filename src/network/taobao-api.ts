@@ -246,7 +246,11 @@ function redactMtopDiagnostics(value: string): string {
 }
 
 function asNumber(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
+  if (typeof value !== 'string' || value.trim() === '') return undefined;
+
+  const number = Number(value);
+  return Number.isFinite(number) ? number : undefined;
 }
 
 function asSellerType(value: unknown): 'B' | 'C' | undefined {
@@ -463,11 +467,11 @@ export class TaobaoApiClient {
     const item = getRecord(data, 'item');
     const seller = getRecord(data, 'seller');
     const skuBase = getRecord(data, 'skuBase');
-    const skuCore = this.parseSkuCore(getRecord(getRecord(data, 'skuCore'), 'sku2info'));
+    const directSkuCore = getRecord(getRecord(data, 'skuCore'), 'sku2info');
     const rawPropGroups = getArray(getRecord(data, 'props'), 'groupProps');
     const rawProps = rawPropGroups.flatMap(group => Array.isArray(group) ? group : [group]);
 
-    // Parse apiStack for price/stock
+    // Parse apiStack for price/stock fallbacks. Some responses wrap this under data.
     let apiStackData: UnknownRecord = {};
     const apiStack = getArray(data, 'apiStack');
     const firstApiStack = isRecord(apiStack[0]) ? apiStack[0] : undefined;
@@ -483,13 +487,31 @@ export class TaobaoApiClient {
       }
     }
 
-    const apiPrice = getRecord(apiStackData, 'price');
+    const apiStackDetail = getRecord(apiStackData, 'data');
+    const apiData = Object.keys(apiStackDetail).length > 0 ? apiStackDetail : apiStackData;
+    const apiItem = getRecord(apiData, 'item');
+    const apiSkuCore = getRecord(getRecord(apiData, 'skuCore'), 'sku2info');
+    const apiItemSkuCore = getRecord(getRecord(apiItem, 'skuCore'), 'sku2info');
+    const skuCore = this.parseSkuCore({ ...apiItemSkuCore, ...apiSkuCore, ...directSkuCore });
+
+    const apiDataPrice = getRecord(apiData, 'price');
+    const apiPrice = Object.keys(apiDataPrice).length > 0
+      ? apiDataPrice
+      : getRecord(apiItem, 'price');
     const apiPriceDetails = getRecord(apiPrice, 'price');
     const apiExtraPrices = getArray(apiPrice, 'extraPrices');
     const itemPrice = getRecord(item, 'price');
-    const priceInfo = asString(apiPriceDetails.priceText) || asString(itemPrice.priceText) || '';
-    const firstOriginalPrice = isRecord(apiExtraPrices[0]) ? apiExtraPrices[0] : {};
-    const originalPriceInfo = asString(firstOriginalPrice.priceText) || '';
+    const apiPriceMoney = asString(apiPriceDetails.priceMoney) || asString(apiPrice.priceMoney);
+    const apiPriceText = asString(apiPriceDetails.priceText) || asString(apiPrice.priceText);
+    const itemPriceMoney = asString(itemPrice.priceMoney);
+    const itemPriceText = asString(itemPrice.priceText);
+    const priceMoney = apiPriceMoney || apiPriceText || itemPriceMoney || itemPriceText || '';
+    const priceText = apiPriceText || itemPriceText || priceMoney;
+    const firstOriginalPrice = isRecord(apiExtraPrices[0])
+      ? apiExtraPrices[0]
+      : getArray(itemPrice, 'extraPrices').find(isRecord) || {};
+    const originalPriceMoney = asString(firstOriginalPrice.priceMoney) || asString(firstOriginalPrice.priceText);
+    const originalPriceText = asString(firstOriginalPrice.priceText) || originalPriceMoney || '';
 
     // Build SKU list
     const skus: TaobaoItemDetail['skuBase']['skus'] = getArray(skuBase, 'skus')
@@ -497,6 +519,7 @@ export class TaobaoApiClient {
       .map(sku => ({
         skuId: asString(sku.skuId) || '',
         propPath: asString(sku.propPath) || '',
+        image: this.normalizeUrl(sku.image),
       }));
 
     // Determine platform
@@ -517,12 +540,12 @@ export class TaobaoApiClient {
         thumbnail: asString(video.videoThumbnailURL) || '',
       })),
       price: {
-        priceMoney: asString(itemPrice.priceMoney) || priceInfo,
-        priceText: priceInfo || asString(itemPrice.priceText) || '',
+        priceMoney,
+        priceText,
       },
-      originalPrice: originalPriceInfo ? {
-        priceMoney: originalPriceInfo,
-        priceText: originalPriceInfo,
+      originalPrice: originalPriceMoney ? {
+        priceMoney: originalPriceMoney,
+        priceText: originalPriceText,
       } : undefined,
       vagueSellCount: asString(item.vagueSellCount),
       category: undefined, // Not directly available in H5 API
@@ -549,12 +572,12 @@ export class TaobaoApiClient {
       },
       skuBase: {
         props: getArray(skuBase, 'props').filter(isRecord).map(prop => ({
-          pid: asString(prop.pid) || '',
-          name: asString(prop.name) || '',
+          pid: asString(prop.pid) || asString(prop.id) || '',
+          name: asString(prop.name) || asString(prop.label) || asString(prop.key) || '',
           values: getArray(prop, 'values').filter(isRecord).map(value => ({
-            vid: asString(value.vid) || '',
-            name: asString(value.name) || '',
-            image: this.normalizeUrl(value.image),
+            vid: asString(value.vid) || asString(value.id) || '',
+            name: asString(value.name) || asString(value.value) || asString(value.label) || '',
+            image: this.normalizeUrl(value.image || value.img || value.imageUrl),
           })),
         })),
         skus,
@@ -591,7 +614,7 @@ export class TaobaoApiClient {
         };
       }
 
-      const quantity = asNumber(rawSku.quantity);
+      const quantity = asNumber(rawSku.quantity ?? rawSku.stock ?? rawSku.inventory);
       if (quantity !== undefined) normalizedSku.quantity = quantity;
       const quantityText = asString(rawSku.quantityText);
       if (quantityText !== undefined) normalizedSku.quantityText = quantityText;

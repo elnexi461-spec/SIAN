@@ -75,6 +75,7 @@ export interface TaobaoItemDetail {
     skus: Array<{
       skuId: string;
       propPath: string;
+      image?: string;
     }>;
   };
   skuCore?: Record<string, {

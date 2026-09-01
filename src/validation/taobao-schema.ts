@@ -24,7 +24,7 @@ export const TaobaoSkuSchema = z.object({
   propertiesName: z.string(),
   price: z.number(),
   originalPrice: z.number().optional(),
-  stock: z.number(),
+  stock: z.number().nullable(),
   stockText: z.string().optional(),
   image: z.string().optional(),
 });
@@ -77,6 +77,7 @@ export const TaobaoItemDetailSchema = z.object({
     skus: z.array(z.object({
       skuId: z.string(),
       propPath: z.string(),
+      image: z.string().optional(),
     })),
   }),
   skuCore: z.record(z.object({

@@ -1,6 +1,19 @@
 import { TaobaoItemDetail, TaobaoNormalizedProduct, TaobaoSku } from '../types/taobao';
 import { logger } from '../logging';
 
+export function parseTaobaoPrice(value: unknown): number | undefined {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
+  if (typeof value !== 'string') return undefined;
+
+  const match = value
+    .replace(/[,，]/g, '')
+    .match(/-?(?:\d+(?:\.\d*)?|\.\d+)/);
+  if (!match) return undefined;
+
+  const price = Number(match[0]);
+  return Number.isFinite(price) ? price : undefined;
+}
+
 export class TaobaoNormalizer {
   normalize(itemId: string, detail: TaobaoItemDetail): TaobaoNormalizedProduct {
     // Build specifications map
@@ -18,28 +31,23 @@ export class TaobaoNormalizer {
     for (const sku of detail.skuBase.skus) {
       const skuCore = detail.skuCore?.[sku.skuId];
       const propertiesName = this.resolvePropPath(sku.propPath, propMap);
+      const price = parseTaobaoPrice(skuCore?.price?.priceMoney) ??
+        parseTaobaoPrice(skuCore?.price?.priceText) ??
+        parseTaobaoPrice(detail.price.priceMoney) ??
+        parseTaobaoPrice(detail.price.priceText) ??
+        0;
+      const originalPrice = parseTaobaoPrice(detail.originalPrice?.priceMoney) ??
+        parseTaobaoPrice(detail.originalPrice?.priceText);
 
       skus.push({
         skuId: sku.skuId,
         properties: sku.propPath,
         propertiesName,
-        price: skuCore?.price ? parseFloat(skuCore.price.priceMoney) / 100 : parseFloat(detail.price.priceMoney) / 100,
-        originalPrice: detail.originalPrice ? parseFloat(detail.originalPrice.priceMoney) / 100 : undefined,
+        price,
+        originalPrice,
         stock: skuCore?.quantity ?? null,
         stockText: skuCore?.quantityText,
-        image: this.findSkuImage(sku.propPath, propMap),
-      });
-    }
-
-    // If no SKUs, add a default one
-    if (skus.length === 0) {
-      skus.push({
-        skuId: itemId,
-        properties: '',
-        propertiesName: '默认',
-        price: parseFloat(detail.price.priceMoney) / 100 || 0,
-        stock: detail.skuCore?.['0']?.quantity ?? null,
-        stockText: detail.skuCore?.['0']?.quantityText,
+        image: sku.image || this.findSkuImage(sku.propPath, propMap),
       });
     }
 
@@ -55,17 +63,24 @@ export class TaobaoNormalizer {
       shopScore = parseFloat(((dsrScores.description + dsrScores.service + dsrScores.logistics) / 3).toFixed(2));
     }
 
+    const firstStock = skus[0]?.stock;
+    const stockStatus = skus[0]?.stockText ||
+      (firstStock === null || firstStock === undefined
+        ? 'unknown'
+        : firstStock > 0 ? 'in_stock' : 'out_of_stock');
+
     const normalized: TaobaoNormalizedProduct = {
       skuId: itemId,
       itemId,
       platform: detail.platform,
       title: detail.title,
-      price: parseFloat(detail.price.priceMoney) / 100 || undefined,
-      originalPrice: detail.originalPrice ? parseFloat(detail.originalPrice.priceMoney) / 100 : undefined,
+      price: parseTaobaoPrice(detail.price.priceMoney) ?? parseTaobaoPrice(detail.price.priceText),
+      originalPrice: parseTaobaoPrice(detail.originalPrice?.priceMoney) ??
+        parseTaobaoPrice(detail.originalPrice?.priceText),
       currency: 'CNY',
       brand,
       category: detail.category,
-      stockStatus: skus[0]?.stockText || (skus[0]?.stock && skus[0].stock > 0 ? 'in_stock' : 'unknown'),
+      stockStatus,
       shopId: detail.shopInfo.shopId,
       shopName: detail.shopInfo.shopName,
       shopType: detail.shopInfo.sellerType === 'B' ? 'tmall' : 'taobao',
@@ -85,44 +100,64 @@ export class TaobaoNormalizer {
     return normalized;
   }
 
-  private buildPropMap(props: TaobaoItemDetail['skuBase']['props']): Map<string, Map<string, { name: string; image?: string }>> {
-    const map = new Map<string, Map<string, { name: string; image?: string }>>();
+  private buildPropMap(props: TaobaoItemDetail['skuBase']['props']): Map<string, {
+    name: string;
+    values: Map<string, { name: string; image?: string }>;
+  }> {
+    const map = new Map<string, {
+      name: string;
+      values: Map<string, { name: string; image?: string }>;
+    }>();
     for (const prop of props) {
       const valueMap = new Map<string, { name: string; image?: string }>();
       for (const v of prop.values) {
         valueMap.set(v.vid, { name: v.name, image: v.image });
       }
-      map.set(prop.pid, valueMap);
+      map.set(prop.pid, { name: prop.name, values: valueMap });
     }
     return map;
   }
 
-  private resolvePropPath(propPath: string, propMap: Map<string, Map<string, { name: string; image?: string }>>): string {
-    const parts = propPath.split(';');
+  private resolvePropPath(propPath: string, propMap: Map<string, {
+    name: string;
+    values: Map<string, { name: string; image?: string }>;
+  }>): string {
+    const parts = propPath.split(';').map(part => part.trim()).filter(Boolean);
     const resolved: string[] = [];
     for (const part of parts) {
-      const [pid, vid] = part.split(':');
-      const propName = propMap.get(pid);
-      if (propName) {
-        const value = propName.get(vid);
-        if (value) {
-          resolved.push(`${propName.get('__name__')?.name || pid}:${value.name}`);
-        }
+      const separatorIndex = part.indexOf(':');
+      if (separatorIndex <= 0) {
+        resolved.push(part);
+        continue;
+      }
+
+      const pid = part.slice(0, separatorIndex);
+      const vid = part.slice(separatorIndex + 1);
+      const prop = propMap.get(pid);
+      const value = prop?.values.get(vid);
+      if (prop && value) {
+        resolved.push(`${prop.name}:${value.name}`);
+      } else {
+        resolved.push(part);
       }
     }
     return resolved.join(';') || propPath;
   }
 
-  private findSkuImage(propPath: string, propMap: Map<string, Map<string, { name: string; image?: string }>>): string | undefined {
-    const parts = propPath.split(';');
+  private findSkuImage(propPath: string, propMap: Map<string, {
+    name: string;
+    values: Map<string, { name: string; image?: string }>;
+  }>): string | undefined {
+    const parts = propPath.split(';').map(part => part.trim()).filter(Boolean);
     for (const part of parts) {
-      const [pid, vid] = part.split(':');
-      const prop = propMap.get(pid);
-      if (prop) {
-        const value = prop.get(vid);
-        if (value?.image) {
-          return value.image;
-        }
+      const separatorIndex = part.indexOf(':');
+      if (separatorIndex <= 0) continue;
+
+      const pid = part.slice(0, separatorIndex);
+      const vid = part.slice(separatorIndex + 1);
+      const value = propMap.get(pid)?.values.get(vid);
+      if (value?.image) {
+        return value.image;
       }
     }
     return undefined;
